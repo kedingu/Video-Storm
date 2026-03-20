@@ -1,0 +1,19 @@
+DATA:
+    ROOT: ''
+    TRAIN_FILE: ''
+    VAL_FILE: ''
+    DATASET: hmdb51
+    NUM_FRAMES: 8
+    NUM_CLASSES: 51
+    LABEL_LIST: 'labels/hmdb_51_labels.csv'
+MODEL:
+    TYPE: 'videostorm_l'
+    NAME: 'videostorm_l'
+    NUM_CLASSES: 51
+    DROP_PATH_RATE: 0.2
+    PRETRAINED: null
+    RESUME: null
+TRAIN:
+    PRETRAINED_PATH: ''
+    BATCH_SIZE: 8
+    ACCUMULATION_STEPS: 8
