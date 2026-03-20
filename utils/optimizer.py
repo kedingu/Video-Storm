@@ -3,8 +3,10 @@ import torch.optim as optim
 from timm.scheduler.cosine_lr import CosineLRScheduler
 import torch.distributed as dist
 
+
 def is_main_process():
     return dist.get_rank() == 0
+
 
 def check_keywords_in_name(name, keywords=()):
     isin = False
@@ -12,6 +14,7 @@ def check_keywords_in_name(name, keywords=()):
         if keyword in name:
             isin = True
     return isin
+
 
 def set_weight_decay(model, skip_list=(), skip_keywords=(), weight_decay=0.001, lr=2e-6, have=(), not_have=()):
     has_decay = []
@@ -28,7 +31,6 @@ def set_weight_decay(model, skip_list=(), skip_keywords=(), weight_decay=0.001, 
             no_decay.append(param)
         else:
             has_decay.append(param)
-
     return [{'params': has_decay, 'weight_decay': weight_decay, 'lr': lr},
             {'params': no_decay, 'weight_decay': 0., 'lr': lr}]
 
@@ -38,49 +40,36 @@ def fix_text(model):
         if "visual." in name or "mit" in name or "prompts" in name:
             continue
         else:
-            param.requires_grad=False
+            param.requires_grad = False
+
 
 def build_optimizer(config, model):
     model = model.module if hasattr(model, 'module') else model
-    
-    # fix text
+
+    # fix_text uniquement pour les modèles CLIP (ignoré pour VideoSTORM via FIX_TEXT=False)
     if config.MODEL.FIX_TEXT:
         fix_text(model)
-    
-    # set decay and lr
+
     skip = {}
     skip_keywords = {}
     if hasattr(model, 'no_weight_decay'):
         skip = model.no_weight_decay()
     if hasattr(model, 'no_weight_decay_keywords'):
         skip_keywords = model.no_weight_decay_keywords()
-    clip_parameters = set_weight_decay(model, skip, skip_keywords, 
-        weight_decay=config.TRAIN.WEIGHT_DECAY, lr=config.TRAIN.LR, 
-        have=(), not_have=("prompts", "mit", "message_")
-    )
-    msg_parameters = set_weight_decay(model, skip, skip_keywords,
-        weight_decay=config.TRAIN.WEIGHT_DECAY, lr=config.TRAIN.LR*10, 
-        have=("message_",), not_have=()
-    )
-    mit_parameters = set_weight_decay(model, skip, skip_keywords,
-        weight_decay=config.TRAIN.WEIGHT_DECAY, lr=config.TRAIN.LR*10, 
-        have=("mit",), not_have=()
-    )
-    prompts_parameters = set_weight_decay(model, skip, skip_keywords, 
-        weight_decay=config.TRAIN.WEIGHT_DECAY, lr=config.TRAIN.LR*10, 
-        have=("prompts",), not_have=()
-    )
 
-    optimizer = optim.AdamW(clip_parameters + mit_parameters + prompts_parameters + msg_parameters,
-                        betas=(0.9, 0.98), eps=1e-8,)
-   
+    # Groupage simple : tous les paramètres entraînables avec weight_decay/no_weight_decay
+    parameters = set_weight_decay(
+        model, skip, skip_keywords,
+        weight_decay=config.TRAIN.WEIGHT_DECAY,
+        lr=config.TRAIN.LR)
+
+    optimizer = optim.AdamW(parameters, betas=(0.9, 0.98), eps=1e-8)
     return optimizer
 
 
 def build_scheduler(config, optimizer, n_iter_per_epoch):
     num_steps = int(config.TRAIN.EPOCHS * n_iter_per_epoch)
     warmup_steps = int(config.TRAIN.WARMUP_EPOCHS * n_iter_per_epoch)
-
     lr_scheduler = CosineLRScheduler(
         optimizer,
         t_initial=num_steps,
@@ -90,5 +79,4 @@ def build_scheduler(config, optimizer, n_iter_per_epoch):
         cycle_limit=1,
         t_in_epochs=False,
     )
-
     return lr_scheduler
