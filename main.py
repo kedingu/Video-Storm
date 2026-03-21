@@ -78,13 +78,7 @@ def _strip_prefix_if_present(state_dict, prefix="module."):
 
 def _safe_manual_load_pretrained(model: torch.nn.Module, pretrained_path: str,
                                   logger, config):
-    """
-    Local .pth loading with shape-mismatch handling:
-      - support {'model': ...} / {'state_dict': ...} / raw dict
-      - strip 'module.' if present
-      - re-init classification head on shape mismatch (trunc_normal_)
-      - drop any remaining mismatched keys
-    """
+    """Local .pth loading with shape-mismatch handling."""
     if not pretrained_path:
         return
     if os.path.isdir(pretrained_path):
@@ -301,31 +295,64 @@ def main(config):
 
     logger.info(f"ACCUMULATION_STEPS = {config.TRAIN.ACCUMULATION_STEPS}")
 
+    # ---------------------------------------------------------------------------
+    # Training loop
+    #
+    # Checkpoint strategy:
+    #   Step 1 -- save IMMEDIATELY after training (before validation).
+    #             No training work is lost regardless of validation duration.
+    #   Step 2 -- validate only at multiples of 5 (incl. epoch 0) and
+    #             the last 3 epochs; skip all other epochs.
+    #   Step 3 -- save "best" checkpoint only when accuracy improves.
+    # ---------------------------------------------------------------------------
     for epoch in range(start_epoch, config.TRAIN.EPOCHS):
-        is_best = False
+
         train_loader.sampler.set_epoch(epoch)
         train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler,
                         train_loader, config, mixup_fn, amp_enabled, amp_dtype, scaler)
 
-        acc1 = validate(val_loader, model, config, amp_enabled, amp_dtype, scaler)
-        logger.info(
-            f"Accuracy of the network on the {len(val_data)} test videos: {acc1:.1f}%")
-
-        is_best = acc1 > max_accuracy
-        max_accuracy = max(max_accuracy, acc1)
-        logger.info(f'Max accuracy: {max_accuracy:.2f}%')
-
+        # Step 1: checkpoint immediately after training
         if dist.get_rank() == 0 and (
                 epoch % config.SAVE_FREQ == 0
-                or epoch == (config.TRAIN.EPOCHS - 1)):
+                or epoch == config.TRAIN.EPOCHS - 1):
             epoch_saving(
                 config, epoch,
                 model.module if isinstance(
                     model, torch.nn.parallel.DistributedDataParallel) else model,
                 max_accuracy, optimizer, lr_scheduler, logger,
-                config.OUTPUT, is_best)
+                config.OUTPUT, is_best=False)
 
-    # Final multi-view eval
+        # Step 2: selective validation schedule
+        every_5   = (epoch % 5 == 0)
+        last_3    = (epoch >= config.TRAIN.EPOCHS - 3)
+        do_validate = every_5 or last_3
+
+        if not do_validate:
+            logger.info(f"Epoch {epoch}: skipping validation.")
+            continue
+
+        # Step 3: validation
+        acc1 = validate(val_loader, model, config, amp_enabled, amp_dtype, scaler)
+        logger.info(
+            f"Accuracy of the network on the {len(val_data)} test videos: {acc1:.1f}%")
+
+        # Step 4: save best checkpoint if accuracy improved
+        is_best = acc1 > max_accuracy
+        if is_best:
+            max_accuracy = acc1
+            if dist.get_rank() == 0:
+                epoch_saving(
+                    config, epoch,
+                    model.module if isinstance(
+                        model, torch.nn.parallel.DistributedDataParallel) else model,
+                    max_accuracy, optimizer, lr_scheduler, logger,
+                    config.OUTPUT, is_best=True)
+        else:
+            max_accuracy = max(max_accuracy, acc1)
+
+        logger.info(f'Max accuracy: {max_accuracy:.2f}%')
+
+    # Final multi-view eval (4 clips x 3 crops)
     config.defrost()
     config.TEST.NUM_CLIP = 4
     config.TEST.NUM_CROP = 3
@@ -337,7 +364,7 @@ def main(config):
 
 
 # ---------------------------------------------------------------------------
-# Training loop
+# Training step
 # ---------------------------------------------------------------------------
 
 def train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler, train_loader,

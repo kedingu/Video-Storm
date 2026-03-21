@@ -69,30 +69,30 @@ def epoch_saving(config, epoch, model,  max_accuracy, optimizer, lr_scheduler, l
 def load_checkpoint(config, model, optimizer, lr_scheduler, logger):
     if os.path.isfile(config.MODEL.RESUME): 
         logger.info(f"==============> Resuming form {config.MODEL.RESUME}....................")
-        checkpoint = torch.load(config.MODEL.RESUME, map_location='cpu', weights_only=True)
+        checkpoint = torch.load(config.MODEL.RESUME, map_location='cpu', weights_only=False)
         load_state_dict = checkpoint['model']
-
+        
         msg = model.load_state_dict(load_state_dict, strict=False)
         logger.info(f"resume model: {msg}")
-
+        
         try:
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-
+            
             start_epoch = checkpoint['epoch'] + 1
             max_accuracy = checkpoint['max_accuracy']
-
+            
             logger.info(f"=> loaded successfully '{config.MODEL.RESUME}' (epoch {checkpoint['epoch']})")
             
             del checkpoint
             torch.cuda.empty_cache()
-
+            
             return start_epoch, max_accuracy
         except:
             del checkpoint
             torch.cuda.empty_cache()
             return 0, 0.
-
+            
     else:
         logger.info(("=> no checkpoint found at '{}'".format(config.MODEL.RESUME)))
         return 0, 0
