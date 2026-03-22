@@ -286,9 +286,15 @@ class UniRepLKNetBlock(nn.Module):
                       else None)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
+        # Parameter-free RMSNorm applied unconditionally to stabilise fp16 with
+        # ImageNet-22K pretrained gammas. Mirrors the normalisation that the full
+        # model applies before the shared SE when a temporal branch is present.
+        self.rms_norm = RMSNorm2d()
+
     def compute_residual(self, x):
-        # Spatial path only -- no temporal branch
-        y = self.se(self.norm(self.dwconv(x)))
+        v_s = self.norm(self.dwconv(x))
+        # RMSNorm stabilises large-magnitude activations from ImageNet-22K gammas
+        y = self.se(self.rms_norm(v_s))
         y = self.pwconv2(self.act(self.pwconv1(y)))
         if self.gamma is not None:
             y = self.gamma.view(1, -1, 1, 1) * y

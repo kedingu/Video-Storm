@@ -10,7 +10,7 @@ MODEL:
     TYPE: 'videostorm_l'
     NAME: 'videostorm_l'
     NUM_CLASSES: 400
-    DROP_PATH_RATE: 0.2
+    DROP_PATH_RATE: 0.1
     PRETRAINED: null
     RESUME: null
 TRAIN:

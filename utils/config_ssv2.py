@@ -27,7 +27,7 @@ _C.DATA.LABEL_LIST = 'labels/kinetics_400_labels.csv'
 _C.MODEL = CN()
 _C.MODEL.TYPE = 'videostorm_b'
 _C.MODEL.NAME = 'videostorm_b'
-_C.MODEL.DROP_PATH_RATE = 0.2
+_C.MODEL.DROP_PATH_RATE = 0.1
 _C.MODEL.PRETRAINED = None
 _C.MODEL.RESUME = None
 _C.MODEL.FIX_TEXT = True
@@ -38,11 +38,11 @@ _C.MODEL.LABEL_SMOOTHING = 0.0
 # Training settings
 # -----------------------------------------------------------------------------
 _C.TRAIN = CN()
-_C.TRAIN.EPOCHS = 30
+_C.TRAIN.EPOCHS = 40
 _C.TRAIN.START_EPOCH = 0
 _C.TRAIN.WARMUP_EPOCHS = 5
 _C.TRAIN.WEIGHT_DECAY = 0.001
-_C.TRAIN.LR = 9.5e-4
+_C.TRAIN.LR = 9.5e-5
 _C.TRAIN.BATCH_SIZE = 8
 _C.TRAIN.ACCUMULATION_STEPS = 8
 _C.TRAIN.LR_SCHEDULER = 'cosine'
