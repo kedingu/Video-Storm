@@ -21,14 +21,6 @@ Pipeline (frame-wise on B*T frames):
     video_head (Conv1x1->BN->SiLU->AdaptiveAvgPool->Linear)
 
 ImageNet checkpoint compatibility: identical to full VideoSTORM.
-
-Overflow prevention (IN-22K gamma/beta preservation):
-    normalize_block_bn() scales BN gamma/beta proportionally at load time instead
-    of resetting them to 1/0. DilatedReparamBlock BN gammas are divided by the
-    number of branches (N) so their sum has controlled magnitude. block.norm and
-    FFN BN gammas are max-normalized to bound |gamma| <= 1. This preserves the
-    relative channel importance structure learned on IN-22K while preventing fp16
-    overflow. Zero runtime memory cost, zero forward path modification.
 """
 
 import torch
@@ -284,12 +276,7 @@ class UniRepLKNetBlock(nn.Module):
     """Spatial building block with large-kernel depthwise convolution, SE recalibration,
     and a GRN-FFN. Module names are frozen for ImageNet checkpoint compatibility.
     When num_frames > 0, an AdaptiveTemporalConv branch is fused with the spatial
-    features via parameter-free RMSNorm before the shared SE.
-
-    Overflow prevention is handled at load time by normalize_block_bn() which scales
-    BN gamma/beta proportionally (division by N for DilatedReparamBlock branches,
-    max-normalization for block.norm and FFN BN). Forward path is unmodified --
-    zero runtime overhead."""
+    features via parameter-free RMSNorm before the shared SE."""
     def __init__(self, dim, kernel_size, drop_path=0.,
                  layer_scale_init_value=1e-6, deploy=False,
                  attempt_use_lk_impl=True, with_cp=False,
@@ -610,76 +597,41 @@ class VideoSTORM(nn.Module):
         feat_bt, B, T = self.forward_features(x)
         return self.video_head(feat_bt).view(B, T, -1).mean(1)
 
-    # ------------------------------------------------------------------
-    # Pretrained loading
-    # ------------------------------------------------------------------
-
-    def normalize_block_bn(self):
-        """Normalize BN gamma/beta in backbone stages 0-3 to prevent fp16 overflow
-        from IN-22K multi-branch accumulation, while preserving relative channel
-        importance learned during pretraining.
-
-        For each target covered by the original reset_block_bn():
-          - DilatedReparamBlock BNs (origin_bn + all dil_bn): gamma and beta are
-            divided by the number of branches (N). Since forward() sums all N
-            branches, dividing each by N makes the sum magnitude equivalent to a
-            single branch -- prevents forward overflow AND backward gradient
-            explosion through the N-branch gamma chain.
-          - block.norm (BN after dwconv): gamma and beta are divided by
-            max(|gamma|, 1) to bound |gamma| <= 1 while preserving relative order.
-          - block.pwconv2[-1] (FFN final BN): same max-normalization.
-
-        Running_mean/var are untouched (warm-start statistics preserved).
-        Zero runtime memory cost (weights modified in-place at load time only)."""
+    def reset_block_bn(self):
+        """Reset BN gamma->1, beta->0 for all stage-block BNs (stages 0-3)."""
         n_dilated = n_block_bn = 0
         for stage in self.stages:
             for block in stage:
                 if not isinstance(block, UniRepLKNetBlock):
                     continue
-
-                # --- DilatedReparamBlock BNs: divide by number of branches ---
                 if isinstance(block.dwconv, DilatedReparamBlock):
                     drb = block.dwconv
-                    n_branches = 1 + len(drb.kernel_sizes)  # origin + dilated
                     if hasattr(drb, 'origin_bn'):
-                        drb.origin_bn.weight.data.div_(n_branches)
-                        drb.origin_bn.bias.data.div_(n_branches)
+                        nn.init.ones_(drb.origin_bn.weight)
+                        nn.init.zeros_(drb.origin_bn.bias)
                         n_dilated += 1
                     for k, r in zip(drb.kernel_sizes, drb.dilates):
                         bn = getattr(drb, f'dil_bn_k{k}_{r}', None)
                         if bn is not None:
-                            bn.weight.data.div_(n_branches)
-                            bn.bias.data.div_(n_branches)
+                            nn.init.ones_(bn.weight)
+                            nn.init.zeros_(bn.bias)
                             n_dilated += 1
-
-                # --- block.norm (BN post-dwconv): max-normalize gamma ---
                 if hasattr(block.norm, 'weight'):
-                    scale = block.norm.weight.data.abs().max().clamp(min=1.0)
-                    block.norm.weight.data.div_(scale)
-                    block.norm.bias.data.div_(scale)
+                    nn.init.ones_(block.norm.weight)
+                    nn.init.zeros_(block.norm.bias)
                     n_block_bn += 1
-
-                # --- pwconv2 final BN: max-normalize gamma ---
                 ffn_bn = block.pwconv2[-1]
                 if hasattr(ffn_bn, 'weight'):
-                    scale = ffn_bn.weight.data.abs().max().clamp(min=1.0)
-                    ffn_bn.weight.data.div_(scale)
-                    ffn_bn.bias.data.div_(scale)
+                    nn.init.ones_(ffn_bn.weight)
+                    nn.init.zeros_(ffn_bn.bias)
                     n_block_bn += 1
-
-        print(f'[NORMALIZE] {n_dilated + n_block_bn} BNs normalized '
+        print(f'[RESET] {n_dilated + n_block_bn} BNs reset '
               f'({n_dilated} DilatedReparamBlock + {n_block_bn} block BNs). '
-              f'Relative gamma structure preserved. running_mean/var untouched.')
+              f'running_mean/var preserved.')
 
     def load_pretrained_2d(self, ckpt, strict=False, skip_head=True,
                             map_location='cpu'):
-        """Load a 2D ImageNet checkpoint into VideoSTORM Ablation B.
-        For ImageNet checkpoints, normalize_block_bn() is called after loading to
-        scale BN gamma/beta proportionally -- preventing fp16 overflow while preserving
-        the relative channel importance structure learned on IN-22K. Forward path is
-        unchanged (no runtime overhead). For video resume checkpoints, gammas are
-        preserved as-is (they were already normalized or trained from normalized state).
-        DDP prefix stripped automatically."""
+        """Load a 2D ImageNet checkpoint into VideoSTORM Ablation B."""
         def _load(p):
             if isinstance(p, str) and p.startswith('http'):
                 return torch.hub.load_state_dict_from_url(p, map_location=map_location,
@@ -713,9 +665,9 @@ class VideoSTORM(nn.Module):
 
             if ckpt_type == 'video_resume':
                 epoch_info = f"epoch {raw['epoch']}" if 'epoch' in raw else 'epoch unknown'
-                print(f'[RESUME] {epoch_info} -- BN gammas preserved as-is.')
+                print(f'[RESUME] {epoch_info} -- BN gammas preserved.')
             else:
-                print('[INIT] ImageNet checkpoint -- BN gamma normalization will apply.')
+                print('[INIT] ImageNet checkpoint -- BN gamma reset will apply.')
 
             if skip_head:
                 skip_keys = [k for k in state
@@ -734,7 +686,7 @@ class VideoSTORM(nn.Module):
                 print(f'[SUCCESS] {len(state)} parameters loaded.')
 
             if ckpt_type == 'imagenet':
-                self.normalize_block_bn()
+                self.reset_block_bn()
 
         except FileNotFoundError as e:
             print(f'[ERROR] File not found: {src} -- {e}'); raise

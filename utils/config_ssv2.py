@@ -38,7 +38,7 @@ _C.MODEL.LABEL_SMOOTHING = 0.0
 # Training settings
 # -----------------------------------------------------------------------------
 _C.TRAIN = CN()
-_C.TRAIN.EPOCHS = 60
+_C.TRAIN.EPOCHS = 40
 _C.TRAIN.START_EPOCH = 0
 _C.TRAIN.WARMUP_EPOCHS = 5
 _C.TRAIN.WEIGHT_DECAY = 0.001
