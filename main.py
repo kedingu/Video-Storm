@@ -244,7 +244,11 @@ def main(config):
 
     # AMP (fp16 / bf16)
     amp_enabled, amp_dtype = _amp_flags_and_dtype(config)
-    if HAS_APEX and (getattr(config.TRAIN, "OPT_LEVEL", "O1") != "O0") and not eval_only:
+    # [MODIFIED] Added 'and amp_dtype != torch.bfloat16' to bypass Apex when BF16.
+    # Apex AMP does not support BF16 -- it forces fp16 internally.
+    # BF16 uses PyTorch native autocast without GradScaler.
+    # if HAS_APEX and (getattr(config.TRAIN, "OPT_LEVEL", "O1") != "O0") and not eval_only:
+    if HAS_APEX and (getattr(config.TRAIN, "OPT_LEVEL", "O1") != "O0") and amp_dtype != torch.bfloat16 and not eval_only:
         model, optimizer = amp.initialize(
             models=model, optimizers=optimizer,
             opt_level=config.TRAIN.OPT_LEVEL)
@@ -286,6 +290,16 @@ def main(config):
                         else model)
         start_epoch, max_accuracy = load_checkpoint(
             config, target_model, optimizer, lr_scheduler, logger)
+        
+        # ── VALIDATE ON RESUME ──────────────────────────────────────────────
+        #
+        #acc1_on_resume = validate(val_loader, model, config,
+        #                         amp_enabled, amp_dtype, scaler)
+        #logger.info(
+        #    f"[RESUME] Validation after loading '{config.MODEL.RESUME}': "
+        #    f"{acc1_on_resume:.2f}%  (tracked best so far: {max_accuracy:.2f}%)")
+        # ── END VALIDATE ON RESUME ──────────────────────────────────────────
+        
 
     if config.TEST.ONLY_TEST:
         acc1 = validate(val_loader, model, config, amp_enabled, amp_dtype, scaler)
@@ -390,7 +404,11 @@ def train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler, train_load
         if mixup_fn is not None:
             images, label_id = mixup_fn(images, label_id)
 
-        if HAS_APEX and (getattr(config.TRAIN, "OPT_LEVEL", "O1") != "O0"):
+        # [MODIFIED] Added 'and amp_dtype != torch.bfloat16' to bypass Apex when BF16.
+        # Apex amp.scale_loss does not support BF16 -- forward/backward must use
+        # PyTorch native autocast path below.
+        # if HAS_APEX and (getattr(config.TRAIN, "OPT_LEVEL", "O1") != "O0"):
+        if HAS_APEX and (getattr(config.TRAIN, "OPT_LEVEL", "O1") != "O0") and amp_dtype != torch.bfloat16:
             output = model(images)
             total_loss = (criterion(output, label_id)
                           / max(1, config.TRAIN.ACCUMULATION_STEPS))

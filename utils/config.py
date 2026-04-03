@@ -38,11 +38,11 @@ _C.MODEL.LABEL_SMOOTHING = 0.0
 # Training settings
 # -----------------------------------------------------------------------------
 _C.TRAIN = CN()
-_C.TRAIN.EPOCHS = 50
+_C.TRAIN.EPOCHS = 30
 _C.TRAIN.START_EPOCH = 0
 _C.TRAIN.WARMUP_EPOCHS = 5
 _C.TRAIN.WEIGHT_DECAY = 0.001
-_C.TRAIN.LR = 8.e-5
+_C.TRAIN.LR = 8.e-4
 _C.TRAIN.BATCH_SIZE = 8
 _C.TRAIN.ACCUMULATION_STEPS = 8
 _C.TRAIN.LR_SCHEDULER = 'cosine'
@@ -56,7 +56,10 @@ _C.DATA.BATCH_SIZE = 8
 
 # AMP settings
 _C.AMP_OPT_LEVEL = 'O1'
-_C.AMP_DTYPE = 'fp16'  # 'fp16' or 'bf16'
+# [MODIFIED] Default changed from 'fp16' to 'bf16' for H100 native support.
+# BF16 eliminates fp16 overflow (range ~3.4e38) and does not require GradScaler.
+# _C.AMP_DTYPE = 'fp16'
+_C.AMP_DTYPE = 'bf16'
 
 # -----------------------------------------------------------------------------
 # Augmentation settings
