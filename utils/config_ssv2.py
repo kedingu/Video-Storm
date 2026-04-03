@@ -56,7 +56,10 @@ _C.DATA.BATCH_SIZE = 8
 
 # AMP settings
 _C.AMP_OPT_LEVEL = 'O1'
-_C.AMP_DTYPE = 'fp16'  # 'fp16' or 'bf16'
+# [MODIFIED] Default changed from 'fp16' to 'bf16' for H100 native support.
+# BF16 eliminates fp16 overflow (range ~3.4e38) and does not require GradScaler.
+# _C.AMP_DTYPE = 'fp16'
+_C.AMP_DTYPE = 'bf16'
 
 # -----------------------------------------------------------------------------
 # Augmentation settings
