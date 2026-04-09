@@ -310,7 +310,7 @@ def build_dataloader(logger, config):
         train_data,
         sampler=sampler_train,
         batch_size=config.TRAIN.BATCH_SIZE,
-        num_workers=16,
+        num_workers=12,
         pin_memory=True,
         drop_last=True,
         collate_fn=partial(mmcv_collate, samples_per_gpu=config.TRAIN.BATCH_SIZE),
