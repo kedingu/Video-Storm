@@ -52,6 +52,13 @@ _C.TRAIN.AUTO_RESUME = False
 _C.TRAIN.USE_CHECKPOINT = False
 _C.TRAIN.CLIP_GRAD = 1.0
 _C.TRAIN.PRETRAINED_PATH = None
+# [ADDED] Weight of the auxiliary loss relative to the main loss.
+# VideoSTORM.forward() returns dict(main=..., aux=...) during training;
+# total_loss = loss_main + AUX_LOSS_RATIO * loss_aux.
+# The auxiliary head supervises raw stage-4 features (x_s3) directly,
+# providing a gradient path to the backbone that bypasses the sub-stage
+# blocks.  0.4 matches the default used by OverLoCK.
+_C.TRAIN.AUX_LOSS_RATIO = 0.4
 _C.DATA.BATCH_SIZE = 8
 
 # AMP settings

@@ -290,7 +290,7 @@ def main(config):
                         else model)
         start_epoch, max_accuracy = load_checkpoint(
             config, target_model, optimizer, lr_scheduler, logger)
-        
+
         # ── VALIDATE ON RESUME ──────────────────────────────────────────────
         #
         #acc1_on_resume = validate(val_loader, model, config,
@@ -299,7 +299,6 @@ def main(config):
         #    f"[RESUME] Validation after loading '{config.MODEL.RESUME}': "
         #    f"{acc1_on_resume:.2f}%  (tracked best so far: {max_accuracy:.2f}%)")
         # ── END VALIDATE ON RESUME ──────────────────────────────────────────
-        
 
     if config.TEST.ONLY_TEST:
         acc1 = validate(val_loader, model, config, amp_enabled, amp_dtype, scaler)
@@ -308,6 +307,9 @@ def main(config):
         return
 
     logger.info(f"ACCUMULATION_STEPS = {config.TRAIN.ACCUMULATION_STEPS}")
+
+    # [ADDED] Log aux loss ratio so it is visible in experiment logs.
+    logger.info(f"AUX_LOSS_RATIO = {config.TRAIN.AUX_LOSS_RATIO}")
 
     # ---------------------------------------------------------------------------
     # Training loop
@@ -389,6 +391,14 @@ def train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler, train_load
     num_steps = len(train_loader)
     batch_time = AverageMeter()
     tot_loss_meter = AverageMeter()
+    # [ADDED] Separate meter for the auxiliary loss so its convergence is visible
+    # in training logs.  aux_loss_meter tracks loss_aux (before the ratio scaling),
+    # giving the raw magnitude of the backbone supervision signal.
+    aux_loss_meter = AverageMeter()
+
+    # [ADDED] Read aux loss ratio once per epoch (avoids repeated config look-ups).
+    # TRAIN.AUX_LOSS_RATIO is defined in config.py (default 0.4, mirrors OverLoCK).
+    aux_ratio = config.TRAIN.AUX_LOSS_RATIO
 
     start = time.time()
     end = time.time()
@@ -404,41 +414,98 @@ def train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler, train_load
         if mixup_fn is not None:
             images, label_id = mixup_fn(images, label_id)
 
+        # ------------------------------------------------------------------
+        # Forward + backward — three AMP branches.
+        #
+        # [MODIFIED] All three branches now handle the dict output returned by
+        # VideoSTORM.forward() during training:
+        #   output = {'main': Tensor(B, C), 'aux': Tensor(B, C)}
+        # total_loss = (loss_main + AUX_LOSS_RATIO * loss_aux) / ACCUM_STEPS
+        #
+        # In eval mode VideoSTORM returns a plain Tensor, so validate() is
+        # unaffected.  The isinstance(output, dict) guard also keeps the code
+        # compatible with any non-VideoSTORM model that returns a plain Tensor.
+        # ------------------------------------------------------------------
+
         # [MODIFIED] Added 'and amp_dtype != torch.bfloat16' to bypass Apex when BF16.
         # Apex amp.scale_loss does not support BF16 -- forward/backward must use
         # PyTorch native autocast path below.
         # if HAS_APEX and (getattr(config.TRAIN, "OPT_LEVEL", "O1") != "O0"):
         if HAS_APEX and (getattr(config.TRAIN, "OPT_LEVEL", "O1") != "O0") and amp_dtype != torch.bfloat16:
+            # ---- Apex AMP branch ------------------------------------------
             output = model(images)
-            total_loss = (criterion(output, label_id)
-                          / max(1, config.TRAIN.ACCUMULATION_STEPS))
+            # [MODIFIED] Handle dict output (VideoSTORM aux head).
+            if isinstance(output, dict):
+                loss_main = criterion(output['main'], label_id)
+                loss_aux  = criterion(output['aux'],  label_id)
+                total_loss = ((loss_main + aux_ratio * loss_aux)
+                              / max(1, config.TRAIN.ACCUMULATION_STEPS))
+            else:
+                loss_main = None
+                loss_aux  = None
+                total_loss = (criterion(output, label_id)
+                              / max(1, config.TRAIN.ACCUMULATION_STEPS))
             with amp.scale_loss(total_loss, optimizer) as scaled_loss:
                 scaled_loss.backward()
         else:
             if amp_enabled:
+                # ---- PyTorch native AMP branch ----------------------------
                 with torch.amp.autocast(device_type='cuda', dtype=amp_dtype,
                                         enabled=True):
                     output = model(images)
-                    total_loss = (criterion(output, label_id)
-                                  / max(1, config.TRAIN.ACCUMULATION_STEPS))
+                    # [MODIFIED] Handle dict output (VideoSTORM aux head).
+                    if isinstance(output, dict):
+                        loss_main = criterion(output['main'], label_id)
+                        loss_aux  = criterion(output['aux'],  label_id)
+                        total_loss = ((loss_main + aux_ratio * loss_aux)
+                                      / max(1, config.TRAIN.ACCUMULATION_STEPS))
+                    else:
+                        loss_main = None
+                        loss_aux  = None
+                        total_loss = (criterion(output, label_id)
+                                      / max(1, config.TRAIN.ACCUMULATION_STEPS))
                 if scaler is not None and scaler.is_enabled():
                     scaler.scale(total_loss).backward()
                 else:
                     total_loss.backward()
             else:
+                # ---- fp32 branch ------------------------------------------
                 output = model(images)
-                total_loss = (criterion(output, label_id)
-                              / max(1, config.TRAIN.ACCUMULATION_STEPS))
+                # [MODIFIED] Handle dict output (VideoSTORM aux head).
+                if isinstance(output, dict):
+                    loss_main = criterion(output['main'], label_id)
+                    loss_aux  = criterion(output['aux'],  label_id)
+                    total_loss = ((loss_main + aux_ratio * loss_aux)
+                                  / max(1, config.TRAIN.ACCUMULATION_STEPS))
+                else:
+                    loss_main = None
+                    loss_aux  = None
+                    total_loss = (criterion(output, label_id)
+                                  / max(1, config.TRAIN.ACCUMULATION_STEPS))
                 total_loss.backward()
 
         def _do_step():
             if (amp_enabled and scaler is not None
                     and scaler.is_enabled() and not HAS_APEX):
                 scaler.unscale_(optimizer)
+                # [ADDED] Apply gradient clipping before the optimizer step.
+                # config.TRAIN.CLIP_GRAD (default 1.0) was defined in config.py
+                # but was silently never applied — a pre-existing omission.
+                # With temporal branches adding new parameter groups, unclipped
+                # gradients are a stability risk during early fine-tuning.
+                # For Apex AMP, unscale is implicit inside amp.scale_loss so
+                # clip_grad_norm is applied after scaler.unscale_ here.
+                if config.TRAIN.CLIP_GRAD > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), config.TRAIN.CLIP_GRAD)
                 if _has_any_grad(model.parameters()):
                     scaler.step(optimizer)
                 scaler.update()
             else:
+                # [ADDED] Same clipping for Apex AMP and plain fp32 paths.
+                if config.TRAIN.CLIP_GRAD > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), config.TRAIN.CLIP_GRAD)
                 if _has_any_grad(model.parameters()):
                     optimizer.step()
             optimizer.zero_grad(set_to_none=True)
@@ -453,6 +520,12 @@ def train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler, train_load
         torch.cuda.synchronize()
 
         tot_loss_meter.update(total_loss.item(), len(label_id))
+        # [ADDED] Track aux loss separately when the model returns a dict.
+        # loss_aux is the raw auxiliary CE (before ratio scaling) so its magnitude
+        # is directly comparable to tot_loss and indicates backbone convergence.
+        if loss_aux is not None:
+            aux_loss_meter.update(loss_aux.item(), len(label_id))
+
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -460,12 +533,24 @@ def train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler, train_load
             lr = optimizer.param_groups[0]['lr']
             memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
             etas = batch_time.avg * (num_steps - idx)
-            logger.info(
-                f'Train: [{epoch}/{config.TRAIN.EPOCHS}][{idx}/{num_steps}]\t'
-                f'eta {datetime.timedelta(seconds=int(etas))} lr {lr:.9f}\t'
-                f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
-                f'tot_loss {tot_loss_meter.val:.4f} ({tot_loss_meter.avg:.4f})\t'
-                f'mem {memory_used:.0f}MB')
+            # [MODIFIED] Log aux loss alongside total loss when available.
+            # aux_loss shows raw backbone supervision; tot_loss is the full
+            # combined loss (main + ratio*aux) / accum_steps.
+            if aux_loss_meter.count > 0:
+                logger.info(
+                    f'Train: [{epoch}/{config.TRAIN.EPOCHS}][{idx}/{num_steps}]\t'
+                    f'eta {datetime.timedelta(seconds=int(etas))} lr {lr:.9f}\t'
+                    f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
+                    f'tot_loss {tot_loss_meter.val:.4f} ({tot_loss_meter.avg:.4f})\t'
+                    f'aux_loss {aux_loss_meter.val:.4f} ({aux_loss_meter.avg:.4f})\t'
+                    f'mem {memory_used:.0f}MB')
+            else:
+                logger.info(
+                    f'Train: [{epoch}/{config.TRAIN.EPOCHS}][{idx}/{num_steps}]\t'
+                    f'eta {datetime.timedelta(seconds=int(etas))} lr {lr:.9f}\t'
+                    f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
+                    f'tot_loss {tot_loss_meter.val:.4f} ({tot_loss_meter.avg:.4f})\t'
+                    f'mem {memory_used:.0f}MB')
 
     epoch_time = time.time() - start
     logger.info(
@@ -506,6 +591,14 @@ def validate(val_loader, model, config, amp_enabled, amp_dtype, scaler):
                     output = model(image_input)
             else:
                 output = model(image_input)
+
+            # model.eval() causes VideoSTORM.forward() to return a plain Tensor
+            # (no dict).  The isinstance guard below is a safety net for any
+            # model that may still return a dict/tuple in eval mode.
+            if isinstance(output, dict):
+                output = output['main']
+            elif isinstance(output, (list, tuple)):
+                output = output[0]
 
             similarity = output.view(b, -1).softmax(dim=-1)
             tot_similarity += similarity
@@ -561,15 +654,15 @@ if __name__ == '__main__':
     cudnn.benchmark = True
 
     Path(config.OUTPUT).mkdir(parents=True, exist_ok=True)
-    
+
     logger = create_logger(
         output_dir=config.OUTPUT,
         dist_rank=dist.get_rank(),
         name=f"{config.MODEL.TYPE}")
     logger.info(f"working dir: {config.OUTPUT}")
-    
+
     if dist.get_rank() == 0:
         logger.info(config)
         shutil.copy(args.config, config.OUTPUT)
-        
+
     main(config)

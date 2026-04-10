@@ -108,11 +108,10 @@ def merge_dilated_into_large_kernel(large_kernel, dilated_kernel, dilated_r):
 
 
 # ---------------------------------------------------------------------------
-# 1D reparameterization helpers  (mirrors of the 2D equivalents above)
+# 1D reparameterization helpers
 # ---------------------------------------------------------------------------
 
 def fuse_bn_1d(conv, bn):
-    """Fuse Conv1d + BN1d into a single Conv1d with bias."""
     conv_bias = 0 if conv.bias is None else conv.bias
     std = (bn.running_var + bn.eps).sqrt()
     return (conv.weight * (bn.weight / std).reshape(-1, 1, 1),
@@ -120,7 +119,6 @@ def fuse_bn_1d(conv, bn):
 
 
 def convert_dilated_to_nondilated_1d(kernel, dilate_rate):
-    """Expand a dilated depthwise Conv1d kernel to its non-dilated equivalent."""
     identity_kernel = torch.ones((1, 1, 1), device=kernel.device)
     if kernel.size(1) == 1:
         return F.conv_transpose1d(kernel, identity_kernel, stride=dilate_rate)
@@ -130,7 +128,6 @@ def convert_dilated_to_nondilated_1d(kernel, dilate_rate):
 
 
 def merge_dilated_into_large_kernel_1d(large_kernel, dilated_kernel, dilated_r):
-    """Accumulate a dilated 1D branch into the large-kernel equivalent."""
     large_k = large_kernel.size(2)
     equivalent_kernel_size = dilated_r * (dilated_kernel.size(2) - 1) + 1
     equivalent_kernel = convert_dilated_to_nondilated_1d(dilated_kernel, dilated_r)
@@ -139,9 +136,9 @@ def merge_dilated_into_large_kernel_1d(large_kernel, dilated_kernel, dilated_r):
 
 
 def _temporal_kernel_size(num_frames):
-    """Largest odd kernel <= num_frames, capped at 9 for FLOPs budget."""
-    k = (num_frames - 1) // 2 * 2 + 1   # largest odd number <= num_frames
-    return max(min(k, 9), 3)             # in [3, 9], always odd
+    """Largest odd kernel <= num_frames, capped at 9."""
+    k = (num_frames - 1) // 2 * 2 + 1
+    return max(min(k, 9), 3)
 
 
 # ---------------------------------------------------------------------------
@@ -155,28 +152,6 @@ class ResDWConv(nn.Conv2d):
 
     def forward(self, x):
         return x + super().forward(x)
-
-
-class TemporalResDWConv(nn.Module):
-    """Residual depthwise Conv1d along T. Pivot: (B*T,C,H,W) <-> (B*H*W,C,T).
-    Kept for backward-compatibility; no longer used inside DynamicSTORMBlock."""
-    def __init__(self, dim, num_frames, kernel_size=3):
-        super().__init__()
-        self.num_frames = num_frames
-        self.conv = nn.Conv1d(dim, dim, kernel_size=kernel_size,
-                              padding=kernel_size // 2, groups=dim, bias=False)
-
-    def forward(self, x):
-        BT, C, H, W = x.shape
-        T = self.num_frames
-        B = BT // T
-        x_1d = (x.view(B, T, C, H, W)
-                  .permute(0, 3, 4, 2, 1).contiguous()
-                  .view(B * H * W, C, T))
-        x_1d = x_1d + self.conv(x_1d)
-        return (x_1d.view(B, H, W, C, T)
-                    .permute(0, 4, 3, 1, 2).contiguous()
-                    .view(BT, C, H, W))
 
 
 class GRN(nn.Module):
@@ -349,18 +324,16 @@ class DilatedReparamBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 1D reparameterizable block  (temporal mirror of DilatedReparamBlock)
+# TemporalReceptiveBlock  (1D mirror of DilatedReparamBlock)
 # ---------------------------------------------------------------------------
 
 class TemporalReceptiveBlock(nn.Module):
     """Exact 1D mirror of DilatedReparamBlock.
 
-    Same philosophy: one large-kernel Conv1d 'origin' + N dilated Conv1d
-    branches that are merged at reparameterization time.
-    Supported kernel sizes: 5, 7, 9  (chosen via _temporal_kernel_size).
+    Large-kernel Conv1d origin + N dilated Conv1d branches, merged at
+    reparameterization time. Supported kernel sizes: 5, 7, 9.
     """
 
-    # Branch configs mirroring the 2D counterparts
     _BRANCH_CFG = {
         9: ([5, 5, 3, 3], [1, 2, 3, 4]),
         7: ([5, 3, 3],    [1, 2, 3]),
@@ -389,7 +362,6 @@ class TemporalReceptiveBlock(nn.Module):
                 self.__setattr__(f'dil_bn_k{k}_{r}', BN1d(channels))
 
     def forward(self, x):
-        # x: (N, C, T)
         if not hasattr(self, 'origin_bn'):
             return self.lk_origin(x)
         out = self.origin_bn(self.lk_origin(x))
@@ -399,7 +371,6 @@ class TemporalReceptiveBlock(nn.Module):
         return out
 
     def merge_temporal_branches(self):
-        """Fuse all branches into lk_origin (in-place). Sets deploy mode."""
         if not hasattr(self, 'origin_bn'):
             return
         origin_k, origin_b = fuse_bn_1d(self.lk_origin, self.origin_bn)
@@ -422,20 +393,21 @@ class TemporalReceptiveBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Temporal mirror for UniRepLKNetBlock
+# TemporalTransitionBranch  (temporal mirror for UniRepLKNetBlock)
 # ---------------------------------------------------------------------------
 
 class TemporalTransitionBranch(nn.Module):
     """1D temporal mirror of UniRepLKNetBlock's (dwconv + norm) path.
 
-    Three regimes matching the spatial side:
-      kernel_size == 0  -> not instantiated (handled by the parent block)
-      kernel_size in (3, 5) -> simple Conv1d + BN1d
-      kernel_size >= 7  -> TemporalReceptiveBlock + BN1d  (with reparameterization)
+    Unified k_t regime: the temporal kernel size is determined solely by
+    num_frames, independently of the spatial kernel_size. All active blocks
+    (kernel_size != 0) use the same temporal receptive field regardless of
+    whether their spatial path uses ks=3, ks=5, or ks>=7.
+
+      k_t >= 5  ->  TemporalReceptiveBlock(k_t) + BN1d   (reparameterizable)
+      k_t == 3  ->  Conv1d(k_t=3) + BN1d                 (short clip fallback)
 
     Pivot: (B*T, C, H, W)  <->  (B*H*W, C, T).
-    Zero-initialised gate in the parent block ensures ImageNet-21K weights are
-    preserved at the start of fine-tuning.
     """
 
     def __init__(self, dim, kernel_size, num_frames,
@@ -448,25 +420,16 @@ class TemporalTransitionBranch(nn.Module):
         k_t = _temporal_kernel_size(num_frames)
         self.k_t = k_t
 
-        if kernel_size >= 7:
-            if k_t >= 5:
-                self.dwconv_1d = TemporalReceptiveBlock(dim, k_t, deploy=deploy,
-                                                        use_sync_bn=use_sync_bn)
-            else:
-                # Fallback for very short clips (k_t == 3)
-                self.dwconv_1d = nn.Conv1d(dim, dim, kernel_size=k_t,
-                                           padding=k_t // 2, groups=dim,
-                                           bias=deploy)
+        # Unified regime: k_t is independent of spatial kernel_size.
+        if k_t >= 5:
+            self.dwconv_1d = TemporalReceptiveBlock(dim, k_t, deploy=deploy,
+                                                    use_sync_bn=use_sync_bn)
         else:
-            # kernel_size in (3, 5): simple Conv1d with matching temporal kernel
-            k = min(k_t, kernel_size)
-            self.dwconv_1d = nn.Conv1d(dim, dim, kernel_size=k,
-                                        padding=k // 2, groups=dim,
-                                        bias=deploy)
+            self.dwconv_1d = nn.Conv1d(dim, dim, kernel_size=k_t,
+                                       padding=k_t // 2, groups=dim,
+                                       bias=deploy)
 
         self.norm_1d = nn.Identity() if deploy else BN1d(dim)
-
-    # -- pivot helpers -------------------------------------------------------
 
     @staticmethod
     def _to_1d(x, B, T, H, W):
@@ -488,21 +451,13 @@ class TemporalTransitionBranch(nn.Module):
         out = self.norm_1d(self.dwconv_1d(x_1d))
         return self._from_1d(out, B, T, H, W, C)
 
-    # -- reparameterization --------------------------------------------------
-
     def reparameterize(self):
-        """Merge 1D dilated branches and fuse outer BN1d (deploy mode)."""
-        # Step 1: merge dilated branches inside TemporalReceptiveBlock
         if isinstance(self.dwconv_1d, TemporalReceptiveBlock):
             self.dwconv_1d.merge_temporal_branches()
-
-        # Step 2: fuse outer norm_1d (BN1d) into the conv
         if isinstance(self.norm_1d, (nn.BatchNorm1d, nn.SyncBatchNorm)):
-            # Retrieve the Conv1d to fuse into
-            if isinstance(self.dwconv_1d, TemporalReceptiveBlock):
-                conv = self.dwconv_1d.lk_origin   # already has bias after merge
-            else:
-                conv = self.dwconv_1d
+            conv = (self.dwconv_1d.lk_origin
+                    if isinstance(self.dwconv_1d, TemporalReceptiveBlock)
+                    else self.dwconv_1d)
             w, b = fuse_bn_1d(conv, self.norm_1d)
             fused = nn.Conv1d(w.size(0), w.size(0), w.size(2),
                               stride=1, padding=w.size(2) // 2,
@@ -517,210 +472,213 @@ class TemporalTransitionBranch(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Temporal mirror for DynamicSTORMBlock
+# TemporalOverarchingBranch  (temporal mirror for DynamicSTORMBlock)
 # ---------------------------------------------------------------------------
 
 class TemporalOverarchingBranch(nn.Module):
     """1D temporal mirror of DynamicSTORMBlock's spatial attention path.
 
-    Option B: operates on x AFTER fusion (dim channels), no ctx needed.
-    Mirrors the three structural elements of the spatial path that feed SE:
-      (1) lepe_1d   : TemporalReceptiveBlock + BN1d  (mirror of lepe)
-      (2) attn_1d   : na1d local self-attention      (mirror of na2d_av)
-      (3) gate_1d   : Conv1d + BN1d + SiLU           (mirror of gate)
-    Output: gate_1d * (x_attn_1d + lepe_1d), shape (B*T, C, H, W).
+    Option A: receives x_cat = dwconv_ctx(concat(x, h_x)) BEFORE norm_ctx,
+    preserving direct access to the context signal h_x.
 
-    Pivot: (B*T, C, H, W)  <->  (B*H*W, C, T).
-    Zero-initialised gate in the parent block ensures spatial pretrained
-    weights are preserved at the start of fine-tuning.
+    Input: x_cat  (B*T, out_dim, H, W)  where out_dim = dim + ctx_ch.
+
+    Structural mirrors (one-to-one with the spatial path):
+      Split x_cat_1d -> x_1d (dim) + h_1d (ctx_ch)
+        mirrors: query_src, key_src = split(norm_ctx(x_cat))
+      lepe_1d     : TemporalReceptiveBlock(k_t) + BN1d  on x_1d
+        mirrors: lepe = DilatedReparamBlock(dim, ks) + BN2d  on x (after fusion)
+      weight_q_1d : Conv1d(dim, dim//2, 1) + BN1d  on x_1d
+        mirrors: weight_q = Conv2d(dim, dim//2, 1) + BN2d  on query_src
+      weight_k_1d : Conv1d(ctx_ch, dim//2, 1) + BN1d  on h_1d  (full T kept)
+        mirrors: weight_k = AdaptiveAvgPool2d(7) + Conv2d(ctx_ch, dim//2, 1) + BN2d
+        Note: no pooling along T.  K must vary across frames so na1d_qk
+        produces distinct attention weights per frame.  Pooling to length 1
+        makes K constant along T, which causes uniform softmax and zero
+        gradient on weight_q_1d weights (degenerate average pooling).
+      na1d_qk + na1d_av  local neighbourhood cross-attention along T
+        mirrors: na2d_av  local neighbourhood attention along H x W
+      dyconv_proj_1d : Conv1d(dim, dim, 1) + BN1d
+        mirrors: dyconv_proj
+
+    gate_1d is intentionally absent.  x_t is gated by the spatial gate in
+    DynamicSTORMBlock after spatio-temporal aggregation.  A second gate inside
+    this branch would double-gate x_t while x_attn + lepe are gated only once,
+    dampening temporal gradients and creating an asymmetric contribution.
+
+    Output: x_attn_1d + lepe_1d  shape (B*T, dim, H, W).
+
+    NATTEN 1D is a hard requirement. RuntimeError is raised at instantiation
+    if na1d_qk / na1d_av are unavailable.
     """
 
-    def __init__(self, dim, num_heads, num_frames, spatial_kernel_size,
+    def __init__(self, dim, ctx_ch, num_heads, num_frames, spatial_kernel_size,
                  deploy=False, use_sync_bn=False):
         super().__init__()
+
+        # Hard requirement (point d): no fallback, fail explicitly
+        if not _NATTEN1D_AVAILABLE:
+            raise RuntimeError(
+                '[VideoSTORM] na1d_qk / na1d_av not found in natten.functional. '
+                'TemporalOverarchingBranch requires NATTEN compiled with 1D support '
+                '(NATTEN >= 0.17 with SM90 for H100). '
+                'Recompile NATTEN or set num_frames=0 to disable temporal branches.')
+
         self.num_frames = num_frames
-        self.num_heads = num_heads                      # already doubled by parent
-        self.head_dim_qk = dim // (2 * num_heads)       # mirrors weight_q/weight_k
-        self.head_dim_v  = dim // num_heads             # full head dim for values
+        self.dim = dim
+        self.ctx_ch = ctx_ch
+        self.num_heads = num_heads        # already doubled by parent (num_heads * 2)
+        self.head_dim_qk = dim // (2 * num_heads)
+        self.head_dim_v  = dim // num_heads
         self.scale = self.head_dim_qk ** -0.5
         BN1d = nn.SyncBatchNorm if use_sync_bn else nn.BatchNorm1d
 
         k_t = _temporal_kernel_size(num_frames)
         self.k_t = k_t
 
-        # (1) lepe_1d: mirror of  DilatedReparamBlock(dim, kernel_size) + BN2d
+        # lepe_1d: TemporalReceptiveBlock(k_t) + BN1d  (operates on x_1d only)
         if k_t >= 5:
             lepe_conv = TemporalReceptiveBlock(dim, k_t, deploy=deploy,
-                                              use_sync_bn=use_sync_bn)
+                                               use_sync_bn=use_sync_bn)
         else:
             lepe_conv = nn.Conv1d(dim, dim, kernel_size=k_t,
-                                  padding=k_t // 2, groups=dim,
-                                  bias=deploy)
+                                  padding=k_t // 2, groups=dim, bias=deploy)
         self.lepe_1d = nn.Sequential(lepe_conv, BN1d(dim))
 
-        # (2a) Q, K projections for local self-attention along T
-        #      mirrors weight_q (dim -> dim//2) and weight_k (dim -> dim//2)
+        # weight_q_1d: Conv1d(dim -> dim//2, 1)  on x_1d
         self.weight_q_1d = nn.Sequential(
             nn.Conv1d(dim, dim // 2, kernel_size=1, bias=False),
             BN1d(dim // 2))
+
+        # weight_k_1d: Conv1d(ctx_ch -> dim//2, 1)  on h_1d  — NO pooling.
+        # h_1d has shape (BHW, ctx_ch, T).  Keeping T positions intact ensures
+        # K varies along T, so na1d_qk produces distinct Q·K scores for each
+        # temporal neighbour and weight_q_1d receives a meaningful gradient.
+        # (Pooling to 1 would make K constant → uniform softmax → zero gradient.)
         self.weight_k_1d = nn.Sequential(
-            nn.Conv1d(dim, dim // 2, kernel_size=1, bias=False),
+            nn.Conv1d(ctx_ch, dim // 2, kernel_size=1, bias=False),
             BN1d(dim // 2))
 
-        # (2b) dyconv_proj_1d: mirror of dyconv_proj (Conv2d + BN2d)
+        # dyconv_proj_1d: Conv1d(dim, dim, 1)
         self.dyconv_proj_1d = nn.Sequential(
             nn.Conv1d(dim, dim, kernel_size=1, bias=False),
             BN1d(dim))
 
-        # Learnable relative positional bias (1D counterpart of rpb1/rpb2)
+        # RPB: (heads, 2*k_t - 1) — one scalar per relative temporal distance
         self.rpb_1d = nn.Parameter(torch.zeros(num_heads, 2 * k_t - 1))
 
-        # (3) gate_1d: mirror of  Conv2d(dim,dim,1) + BN2d + SiLU
-        self.gate_1d = nn.Sequential(
-            nn.Conv1d(dim, dim, kernel_size=1, bias=False),
-            BN1d(dim),
-            nn.SiLU())
+        # gate_1d intentionally removed: x_t is gated by the spatial gate in
+        # DynamicSTORMBlock after spatio-temporal aggregation, so adding a
+        # second gate here would double-gate x_t and dampen temporal gradients.
 
     # -- pivot helpers -------------------------------------------------------
 
     @staticmethod
     def _to_1d(x, B, T, H, W):
+        """(B*T, C, H, W) -> (B*H*W, C, T)."""
         return (x.view(B, T, x.size(1), H, W)
                   .permute(0, 3, 4, 2, 1).contiguous()
                   .view(B * H * W, x.size(1), T))
 
     @staticmethod
     def _from_1d(x_1d, B, T, H, W, C):
+        """(B*H*W, C, T) -> (B*T, C, H, W)."""
         return (x_1d.view(B, H, W, C, T)
                     .permute(0, 4, 3, 1, 2).contiguous()
                     .view(B * T, C, H, W))
 
-    # -- RPB helper ----------------------------------------------------------
+    # -- corrected RPB (point c) ---------------------------------------------
 
-    def _apply_rpb_1d(self, attn):
-        # attn: (BHW, heads, T, k_t)
-        # rpb_1d: (heads, 2*k_t - 1)  — select center slice of length k_t
-        half = self.k_t // 2
-        rpb_vals = self.rpb_1d[:, half:half + self.k_t]     # (heads, k_t)
-        return attn + rpb_vals.unsqueeze(0).unsqueeze(2)     # broadcast over BHW, T
+    def _apply_rpb_1d(self, attn, T):
+        """Apply relative positional bias with correct per-position indexing.
 
-    # -- attention along T ---------------------------------------------------
+        Mirrors _apply_rpb exactly in 1D:
+          - Interior frames (with full neighbourhood): centre index repeated.
+          - Edge frames: correctly offset indices, matching NATTEN's truncation.
 
-    def _temporal_attention(self, x_1d):
-        # x_1d: (BHW, C, T)
+        attn  : (B*H*W, heads, T, k_t)
+        rpb_1d: (heads, 2*k_t - 1)
+        returns: attn + rpb  same shape
+        """
+        k = self.k_t
+        dev = attn.device
+        idx_t = torch.arange(0, k, device=dev)             # relative offsets 0..k-1
+        num_repeat = torch.ones(k, dtype=torch.long, device=dev)
+        num_repeat[k // 2] = T - (k - 1)                   # centre repeated T-(k-1) times
+        bias_idx = idx_t.repeat_interleave(num_repeat)      # (T,)
+        bias_idx = torch.flip(bias_idx, [0])                # same flip as spatial RPB
+        # rpb_1d[:, bias_idx]: (heads, T) -> (1, heads, T, 1) for broadcast
+        rpb = self.rpb_1d[:, bias_idx].unsqueeze(0).unsqueeze(-1)
+        return attn + rpb
+
+    # -- cross-attention along T ---------------------------------------------
+
+    def _temporal_attention(self, x_1d, h_1d):
+        """Local neighbourhood cross-attention along T.
+
+        Q from x_1d (content), K from h_1d (context, full T positions).
+        V from x_1d.
+
+        K varies along T because weight_k_1d applies Conv1d pointwise to all T
+        positions of h_1d without pooling.  This is essential: if K were constant
+        along T, all neighbourhood dot-products Q·K would be equal, softmax would
+        be uniform, and weight_q_1d would receive zero gradient.
+
+        x_1d : (B*H*W, dim,    T)
+        h_1d : (B*H*W, ctx_ch, T)
+        """
         BHW, C, T = x_1d.shape
 
-        # Q, K: (BHW, dim//2, T)
+        # Q: (BHW, dim//2, T) -> (BHW, heads, T, head_dim_qk)
         Q = self.weight_q_1d(x_1d) * self.scale
-        K = self.weight_k_1d(x_1d)
-
-        # Reshape to (BHW, heads, T, head_dim_qk)
         Q = Q.view(BHW, self.num_heads, self.head_dim_qk, T).permute(0, 1, 3, 2).contiguous()
+
+        # K: (BHW, ctx_ch, T) -> (BHW, dim//2, T) -> (BHW, heads, T, head_dim_qk)
+        # Pointwise projection preserves T diversity: K[b,h,t,:] != K[b,h,t',:] in general.
+        K = self.weight_k_1d(h_1d)                              # (BHW, dim//2, T)
         K = K.view(BHW, self.num_heads, self.head_dim_qk, T).permute(0, 1, 3, 2).contiguous()
 
-        # V: full C channels -> (BHW, heads, T, head_dim_v)
+        # V: full dim channels -> (BHW, heads, T, head_dim_v)
         V = x_1d.view(BHW, self.num_heads, self.head_dim_v, T).permute(0, 1, 3, 2).contiguous()
 
-        if _NATTEN1D_AVAILABLE and _na1d_qk is not None:
-            # Local neighbourhood attention along T
-            attn = _na1d_qk(Q, K, kernel_size=self.k_t)          # (BHW, heads, T, k_t)
-            attn = self._apply_rpb_1d(attn)
-            attn = torch.softmax(attn, dim=-1)
-            out = _na1d_av(attn, V, kernel_size=self.k_t)         # (BHW, heads, T, head_dim_v)
-        else:
-            # Fallback: global self-attention (acceptable for small T)
-            attn = torch.einsum('bhnd,bhmd->bhnm', Q, K)          # (BHW, heads, T, T)
-            attn = torch.softmax(attn, dim=-1)
-            out = torch.einsum('bhnm,bhmd->bhnd', attn, V)        # (BHW, heads, T, head_dim_v)
+        # Local neighbourhood cross-attention (NATTEN 1D — no fallback)
+        attn = _na1d_qk(Q, K, kernel_size=self.k_t)             # (BHW, heads, T, k_t)
+        attn = self._apply_rpb_1d(attn, T)
+        attn = torch.softmax(attn, dim=-1)
+        out  = _na1d_av(attn, V, kernel_size=self.k_t)          # (BHW, heads, T, head_dim_v)
 
-        # (BHW, heads, T, head_dim_v) -> (BHW, C, T)
         return out.permute(0, 1, 3, 2).contiguous().view(BHW, C, T)
 
     # -- forward -------------------------------------------------------------
 
-    def forward(self, x):
-        """x: (B*T, C, H, W) after fusion -- Option B."""
-        BT, C, H, W = x.shape
+    def forward(self, x_cat):
+        """x_cat: (B*T, out_dim, H, W) = dwconv_ctx output before norm_ctx."""
+        BT, out_dim, H, W = x_cat.shape
         T = self.num_frames
         B = BT // T
 
-        x_1d = self._to_1d(x, B, T, H, W)    # (B*H*W, C, T)
+        x_cat_1d = self._to_1d(x_cat, B, T, H, W)              # (BHW, out_dim, T)
 
-        lepe = self.lepe_1d(x_1d)             # (B*H*W, C, T)
-        gate = self.gate_1d(x_1d)             # (B*H*W, C, T)
-        x_attn = self._temporal_attention(x_1d)
-        x_attn = self.dyconv_proj_1d(x_attn)  # (B*H*W, C, T)
+        # Split into content (x_1d) and context (h_1d) — mirrors query_src / key_src
+        x_1d, h_1d = torch.split(x_cat_1d, [self.dim, self.ctx_ch], dim=1)
 
-        x_t = gate * (x_attn + lepe)          # (B*H*W, C, T)
+        lepe   = self.lepe_1d(x_1d)                             # (BHW, dim, T)
+        x_attn = self._temporal_attention(x_1d, h_1d)
+        x_attn = self.dyconv_proj_1d(x_attn)                    # (BHW, dim, T)
 
-        return self._from_1d(x_t, B, T, H, W, C)   # (B*T, C, H, W)
+        # No gate_1d here: the spatial gate in DynamicSTORMBlock gates the full
+        # spatio-temporal aggregate (x_attn_spatial + lepe_spatial + x_t) uniformly.
+        x_t = x_attn + lepe                                     # (BHW, dim, T)
+
+        return self._from_1d(x_t, B, T, H, W, self.dim)         # (B*T, dim, H, W)
 
     def reparameterize(self):
-        """Merge 1D dilated branches inside lepe_1d."""
         if isinstance(self.lepe_1d[0], TemporalReceptiveBlock):
             self.lepe_1d[0].merge_temporal_branches()
 
 
 # ---------------------------------------------------------------------------
-# AdaptiveTemporalConv  (kept for reference, replaced by TemporalTransitionBranch)
-# ---------------------------------------------------------------------------
-
-class AdaptiveTemporalConv(nn.Module):
-    """Legacy temporal branch -- superseded by TemporalTransitionBranch."""
-
-    @staticmethod
-    def _compute_dilations(num_frames):
-        dilations = [1]
-        d = 2
-        while (2 * d + 1) <= num_frames:
-            dilations.append(d)
-            d *= 2
-        d_terminal = (num_frames - 1) // 2
-        if d_terminal > dilations[-1]:
-            dilations.append(d_terminal)
-        return dilations
-
-    def __init__(self, dim, kernel_size, num_frames, use_sync_bn=False):
-        super().__init__()
-        self.num_frames = num_frames
-        self.kernel_size = kernel_size
-        BN1d = nn.SyncBatchNorm if use_sync_bn else nn.BatchNorm1d
-
-        if kernel_size >= 7:
-            self.dilations = self._compute_dilations(num_frames)
-            for d in self.dilations:
-                self.__setattr__(f't_dil_conv_d{d}',
-                    nn.Conv1d(dim, dim, kernel_size=3, padding=d,
-                              dilation=d, groups=dim, bias=False))
-                self.__setattr__(f't_dil_bn_d{d}', BN1d(dim))
-        elif kernel_size in (3, 5):
-            self.t_dwconv = nn.Conv1d(dim, dim, kernel_size=kernel_size,
-                                      padding=kernel_size // 2,
-                                      groups=dim, bias=False)
-            self.t_norm = BN1d(dim)
-
-    def forward(self, x):
-        BT, C, H, W = x.shape
-        T = self.num_frames
-        B = BT // T
-        x_1d = (x.view(B, T, C, H, W)
-                  .permute(0, 3, 4, 2, 1).contiguous()
-                  .view(B * H * W, C, T))
-        if self.kernel_size >= 7:
-            out = sum(self.__getattr__(f't_dil_bn_d{d}')(
-                          self.__getattr__(f't_dil_conv_d{d}')(x_1d))
-                      for d in self.dilations)
-        elif self.kernel_size in (3, 5):
-            out = self.t_norm(self.t_dwconv(x_1d))
-        else:
-            out = x_1d
-        return (out.view(B, H, W, C, T)
-                   .permute(0, 4, 3, 1, 2).contiguous()
-                   .view(BT, C, H, W))
-
-
-# ---------------------------------------------------------------------------
-# UniRepLKNetBlock  (updated: TemporalTransitionBranch replaces AdaptiveTemporalConv)
+# UniRepLKNetBlock  (unified k_t regime, no learnable fusion gate)
 # ---------------------------------------------------------------------------
 
 class UniRepLKNetBlock(nn.Module):
@@ -764,8 +722,7 @@ class UniRepLKNetBlock(nn.Module):
                       else None)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-        # --- temporal branch (1D mirror of dwconv + norm) ---
-        # No learnable gate: direct addition consistently outperforms gated fusion.
+        # Temporal branch: unified k_t regime, no learnable fusion gate.
         self.temporal_branch = None
         if num_frames > 0 and kernel_size != 0 and not deploy:
             self.temporal_branch = TemporalTransitionBranch(
@@ -774,16 +731,12 @@ class UniRepLKNetBlock(nn.Module):
                 deploy=False, use_sync_bn=use_sync_bn)
 
     def compute_residual(self, x):
-        # Spatial path
         v_s = self.norm(self.dwconv(x))
-
-        # Temporal path: 1D mirror of (dwconv + norm), direct addition before SE
         if self.temporal_branch is not None:
             v_t = self.temporal_branch(x)
             y = self.se(v_s + v_t)
         else:
             y = self.se(v_s)
-
         y = self.pwconv2(self.act(self.pwconv1(y)))
         if self.gamma is not None:
             y = self.gamma.view(1, -1, 1, 1) * y
@@ -795,7 +748,6 @@ class UniRepLKNetBlock(nn.Module):
                else _f(inputs)
 
     def reparameterize(self):
-        # Reparameterize spatial DilatedReparamBlock
         if hasattr(self.dwconv, 'merge_dilated_branches'):
             self.dwconv.merge_dilated_branches()
         if hasattr(self.norm, 'running_var'):
@@ -818,11 +770,8 @@ class UniRepLKNetBlock(nn.Module):
                                     - self.norm.running_mean * self.norm.weight / std)
                 self.dwconv = conv
             self.norm = nn.Identity()
-
-        # Reparameterize temporal branch
         if self.temporal_branch is not None:
             self.temporal_branch.reparameterize()
-
         final_scale = self.gamma.data if self.gamma is not None else 1
         self.gamma = None
         if self.act[1].use_bias and len(self.pwconv2) == 3:
@@ -862,7 +811,7 @@ class RetroActiveBridge(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# DynamicSTORMBlock  (updated: single TemporalOverarchingBranch fused before SE)
+# DynamicSTORMBlock  (Option A, no learnable fusion gate)
 # ---------------------------------------------------------------------------
 
 class DynamicSTORMBlock(nn.Module):
@@ -887,7 +836,6 @@ class DynamicSTORMBlock(nn.Module):
             self.x_scale = LayerScale(ctx_ch, init_value=1)
             self.h_scale = LayerScale(ctx_ch, init_value=1)
 
-        # Spatio-temporal context injection (spatial only; temporal handled by branch)
         self.dwconv_ctx = ResDWConv(out_dim, kernel_size=3)
         self.norm_ctx = LayerNorm2d(out_dim)
 
@@ -922,17 +870,16 @@ class DynamicSTORMBlock(nn.Module):
             nn.SiLU())
         self.se = SEBlock(dim, dim // 4)
 
-        # --- temporal attention branch (1D mirror of spatial attention path) ---
-        # Operates on x after fusion (Option B, dim channels).
-        # No learnable gate: TemporalOverarchingBranch already contains its own
-        # gate_1d (Conv1d+BN1d+SiLU) which controls its internal output magnitude;
-        # an additional scalar gate at fusion level is redundant and empirically
-        # suboptimal vs direct addition.
+        # Temporal branch (Option A): receives x_f = dwconv_ctx(x_cat)
+        # before norm_ctx, preserving direct access to h_x alongside x.
+        # TemporalOverarchingBranch raises RuntimeError if NATTEN 1D is absent.
         self.temporal_branch = None
         if num_frames > 0 and not deploy:
             self.temporal_branch = TemporalOverarchingBranch(
-                dim=dim, num_heads=self.num_heads,
-                num_frames=num_frames, spatial_kernel_size=kernel_size,
+                dim=dim, ctx_ch=ctx_ch,
+                num_heads=self.num_heads,
+                num_frames=num_frames,
+                spatial_kernel_size=kernel_size,
                 deploy=False, use_sync_bn=use_sync_bn)
 
         if not is_last:
@@ -997,18 +944,21 @@ class DynamicSTORMBlock(nn.Module):
         orig_x = x
 
         x_cat = torch.cat([x, h_x], dim=1)
-        x_f = self.dwconv_ctx(x_cat)
-        # norm_ctx applied on pure spatial output (no scattered temporal here)
+        x_f = self.dwconv_ctx(x_cat)         # (B, out_dim, H, W)
         identity = x_f
-        x_f = self.norm_ctx(x_f)
 
+        # Temporal branch (Option A): x_f before norm_ctx.
+        # Contains both x and h_x information, split internally by the branch.
+        x_t = self.temporal_branch(x_f) if self.temporal_branch is not None else None
+
+        x_f = self.norm_ctx(x_f)
         query_src, key_src = torch.split(x_f, [C, self.ctx_ch], dim=1)
 
-        x = self.fusion(x_f)      # (B, dim, H, W) -- Option B pivot point
+        x = self.fusion(x_f)
 
-        # --- spatial attention path ---
-        gate    = self.gate(x)
-        lepe    = self.lepe(x)
+        # Spatial attention path
+        gate = self.gate(x)
+        lepe = self.lepe(x)
 
         is_pad = min(H, W) < self.kernel_size
         if is_pad:
@@ -1050,16 +1000,15 @@ class DynamicSTORMBlock(nn.Module):
 
         x_attn = self.dyconv_proj(x_attn)
 
-        # --- spatio-temporal aggregation then SE then gate (OverLoCK order) ---
-        # Step 1: aggregate spatial (attn + lepe) and temporal contributions
+        # Spatio-temporal aggregation then SE then gate (OverLoCK order):
+        #   (1) aggregate spatial (attn + lepe) and temporal contributions
+        #   (2) SE recalibrates channels on the complete spatio-temporal aggregate
+        #   (3) gate controls output magnitude after SE
         x_agg = x_attn + lepe
-        if self.temporal_branch is not None:
-            x_agg = x_agg + self.temporal_branch(x)
+        if x_t is not None:
+            x_agg = x_agg + x_t
 
-        # Step 2: SE recalibrates channels on the full spatio-temporal aggregate
-        # Step 3: gate controls output magnitude after SE (matches OverLoCK design)
         x_mixed = gate * self.se(x_agg)
-
         x_mixed = self.proj(x_mixed)
 
         if self.is_last:
@@ -1122,6 +1071,10 @@ class VideoSTORM(nn.Module):
                  **kwargs):
         super().__init__()
         assert _NATTEN_AVAILABLE and _EINOPS_AVAILABLE
+        if num_frames > 0:
+            assert _NATTEN1D_AVAILABLE, (
+                '[VideoSTORM] NATTEN 1D support (na1d_qk / na1d_av) is required '
+                'when num_frames > 0. Recompile NATTEN with SM90 support.')
         self.num_classes = num_classes
         self.num_frames = num_frames
         depths = tuple(depths)
@@ -1170,12 +1123,21 @@ class VideoSTORM(nn.Module):
         sub_ks_s2 = kernel_sizes[2][0]
         sub_dpr = [x.item() for x in
                      torch.linspace(0, sub_drop_path_rate, sum(sub_depth))]
+
+        # DynamicSTORMBlock uses ls_init_value=1 (not the backbone's 1e-6).
+        # With 1e-6, sub-stage blocks are quasi-identity for thousands of
+        # iterations — appropriate for backbone blocks (preserve ImageNet weights)
+        # but counterproductive here where the blocks are newly initialised and
+        # need to contribute meaningful residuals from the first iteration.
+        # OverLoCK uses ls_init_value=1 for its equivalent sub-stage blocks.
+        sub_ls_init = 1.0
+
         self.sub_blocks_s2 = nn.ModuleList([
             DynamicSTORMBlock(
                 dim=dims[2], kernel_size=sub_ks_s2,
                 ctx_ch=ctx_ch, smk_size=smk_size,
                 num_heads=sub_num_heads[0], drop_path=sub_dpr[i],
-                layer_scale_init_value=layer_scale_init_value,
+                layer_scale_init_value=sub_ls_init,
                 deploy=deploy, attempt_use_lk_impl=attempt_use_lk_impl,
                 with_cp=with_cp, use_sync_bn=use_sync_bn,
                 ffn_factor=sub_ffn_factor,
@@ -1189,7 +1151,7 @@ class VideoSTORM(nn.Module):
                 dim=dims[3], kernel_size=sub_ks_s3,
                 ctx_ch=ctx_ch, smk_size=smk_size,
                 num_heads=sub_num_heads[1], drop_path=sub_dpr[sub_depth[0] + i],
-                layer_scale_init_value=layer_scale_init_value,
+                layer_scale_init_value=sub_ls_init,
                 deploy=deploy, attempt_use_lk_impl=attempt_use_lk_impl,
                 with_cp=with_cp, use_sync_bn=use_sync_bn,
                 ffn_factor=sub_ffn_factor,
@@ -1204,15 +1166,37 @@ class VideoSTORM(nn.Module):
             nn.Flatten(1),
             nn.Linear(projection, num_classes))
 
+        # Auxiliary head applied to ctx_s3 (raw stage-4 features before sub-stages).
+        # Mirrors OverLoCK's use_ds design: provides a direct gradient path to the
+        # backbone bypassing the sub-stage blocks, which is critical when:
+        #   (a) sub-stage LayerScale starts at 1 (blocks contribute immediately but
+        #       the backbone still benefits from an unobstructed gradient);
+        #   (b) the context features ctx must become discriminative early so that
+        #       weight_k in DynamicSTORMBlock receives a meaningful context signal.
+        # ctx_s3 has dims[3] channels (before context_encoder projection).
+        self.aux_head = nn.Sequential(
+            nn.BatchNorm2d(dims[3]),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(1),
+            nn.Linear(dims[3], num_classes))
+
         self.apply(self._init_weights)
         if torch.distributed.is_initialized():
             self = nn.SyncBatchNorm.convert_sync_batchnorm(self)
 
     def _init_weights(self, m):
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
+        # Conv1d is explicitly included to match Conv2d/Linear init (trunc_normal std=0.02).
+        # Without it, depthwise Conv1d with kernel_size=7 defaults to kaiming with
+        # fan_in=7, giving std≈0.22 — about 11x larger than the 0.02 target, causing
+        # temporal branches to dominate spatial activations during early training.
+        # BN1d explicit init mirrors OverLoCK and guards against future regressions.
+        if isinstance(m, (nn.Conv2d, nn.Conv1d, nn.Linear)):
             trunc_normal_(m.weight, std=.02)
             if hasattr(m, 'bias') and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
+        elif isinstance(m, (nn.BatchNorm1d, nn.SyncBatchNorm)):
+            nn.init.constant_(m.weight, 1.0)
+            nn.init.constant_(m.bias, 0)
 
     def reparameterize_backbone(self):
         for m in self.modules():
@@ -1237,7 +1221,8 @@ class VideoSTORM(nn.Module):
         x, ctx = self.patch_embedx(x, ctx)
         for blk in self.sub_blocks_s3:
             x, ctx = blk(x, ctx, ctx_ori)
-        return x
+        # x_s3 returned for auxiliary supervision (direct gradient to backbone)
+        return x, x_s3
 
     @staticmethod
     def _ensure_bcthw(x):
@@ -1250,13 +1235,25 @@ class VideoSTORM(nn.Module):
     def forward_features(self, x):
         x = self._ensure_bcthw(x)
         B, C, T, H, W = x.shape
-        feat_bt = self._forward_features_2d(
+        feat_bt, ctx_bt = self._forward_features_2d(
             x.permute(0, 2, 1, 3, 4).contiguous().view(B * T, C, H, W))
-        return feat_bt, B, T
+        return feat_bt, ctx_bt, B, T
 
     def forward(self, x):
-        feat_bt, B, T = self.forward_features(x)
-        return self.video_head(feat_bt).view(B, T, -1).mean(1)
+        feat_bt, ctx_bt, B, T = self.forward_features(x)
+
+        # Main prediction: per-frame logits averaged over T
+        main_logits = self.video_head(feat_bt).view(B, T, -1).mean(1)
+
+        if self.training:
+            # Auxiliary prediction from raw stage-4 features (ctx_bt).
+            # Provides a direct gradient to the backbone, bypassing sub-stages.
+            # The trainer must handle the dict output: loss = loss_main + λ * loss_aux
+            # (λ = 0.5 recommended following OverLoCK).
+            aux_logits = self.aux_head(ctx_bt).view(B, T, -1).mean(1)
+            return dict(main=main_logits, aux=aux_logits)
+
+        return main_logits
 
     def load_pretrained_2d(self, ckpt, strict=False, skip_head=True,
                             map_location='cpu'):
@@ -1382,4 +1379,4 @@ def videostorm_l(pretrained_2d=None, pretrained_2d_strict=False, **kwargs):
 
 
 if __name__ == '__main__':
-    print('VideoSTORM')
+    print('VideoSTORM — no temporal learnable fusion gate')
