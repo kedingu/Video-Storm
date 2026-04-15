@@ -550,7 +550,7 @@ class TemporalOverarchingBranch(nn.Module):
         self.num_heads = num_heads
         self.head_dim_qk = dim // (2 * num_heads)
         self.head_dim_v  = dim // num_heads
-        self.scale = self.head_dim_qk ** -0.5
+        self.scale = self.head_dim_v ** -0.5
         BN1d = nn.SyncBatchNorm if use_sync_bn else nn.BatchNorm1d
 
         k_t = _temporal_kernel_size(num_frames)
@@ -593,16 +593,30 @@ class TemporalOverarchingBranch(nn.Module):
                     .view(B * T, C, H, W))
 
     def _apply_rpb_1d(self, attn, T):
-        """Apply relative positional bias with correct per-position indexing."""
+        """Apply relative positional bias with per-neighbour indexing.
+
+        Mirrors _apply_rpb (spatial) in 1D: each query position gets k_t
+        distinct bias values, one per neighbour in the local window.
+
+        attn  : (BHW, heads, T, k_t)
+        rpb_1d: (heads, 2*k_t - 1)
+        returns: attn + rpb  same shape (BHW, heads, T, k_t)
+        """
         k = self.k_t
         dev = attn.device
-        idx_t = torch.arange(0, k, device=dev)
+
+        idx_k = torch.arange(0, k, device=dev)                     # (k,)
+
         num_repeat = torch.ones(k, dtype=torch.long, device=dev)
         num_repeat[k // 2] = T - (k - 1)
-        bias_idx = idx_t.repeat_interleave(num_repeat)
-        bias_idx = torch.flip(bias_idx, [0])
-        rpb = self.rpb_1d[:, bias_idx].unsqueeze(0).unsqueeze(-1)
-        return attn + rpb
+        idx_t = torch.arange(0, k, device=dev)
+        bias_base = idx_t.repeat_interleave(num_repeat)             # (T,)
+        bias_base = torch.flip(bias_base, [0])
+
+        bias_idx = bias_base.unsqueeze(-1) + idx_k.unsqueeze(0)    # (T, k)
+
+        rpb = self.rpb_1d[:, bias_idx]                              # (heads, T, k)
+        return attn + rpb.unsqueeze(0)                              # (1, heads, T, k)
 
     def _temporal_attention(self, x_1d, h_1d):
         """Local neighbourhood cross-attention along T."""
