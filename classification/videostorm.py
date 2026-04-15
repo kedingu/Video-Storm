@@ -255,6 +255,28 @@ class SEBlock(nn.Module):
         return inputs * torch.sigmoid(x).view(-1, self.input_channels, 1, 1)
 
 
+class SEModule(nn.Module):
+    """SE block matching OverLoCK's design: GELU activation, dim//8 reduction.
+
+    Used in STORMBlock (sub-stage) where weights are freshly initialized.
+    SEBlock (ReLU, dim//4) is kept for backbone blocks to preserve pretrained
+    weight compatibility with UniRepLKNet.
+    """
+    def __init__(self, dim, red=8, inner_act=nn.GELU, out_act=nn.Sigmoid):
+        super().__init__()
+        inner_dim = max(16, dim // red)
+        self.proj = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(dim, inner_dim, kernel_size=1),
+            inner_act(),
+            nn.Conv2d(inner_dim, dim, kernel_size=1),
+            out_act(),
+        )
+
+    def forward(self, x):
+        return x * self.proj(x)
+
+
 class DilatedReparamBlock(nn.Module):
     def __init__(self, channels, kernel_size, deploy, use_sync_bn=False,
                  attempt_use_lk_impl=True):
@@ -393,11 +415,11 @@ class TemporalReceptiveBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# TemporalTransitionBranch  (temporal mirror for UniRepLKNetBlock)
+# TemporalTransitionBranch  (temporal for SpatioTemporalLargeKernelBlock)
 # ---------------------------------------------------------------------------
 
 class TemporalTransitionBranch(nn.Module):
-    """1D temporal mirror of UniRepLKNetBlock's (dwconv + norm) path.
+    """1D temporal mirror of SpatioTemporalLargeKernelBlock's (dwconv + norm) path.
 
     Unified k_t regime: the temporal kernel size is determined solely by
     num_frames, independently of the spatial kernel_size. All active blocks
@@ -420,7 +442,6 @@ class TemporalTransitionBranch(nn.Module):
         k_t = _temporal_kernel_size(num_frames)
         self.k_t = k_t
 
-        # Unified regime: k_t is independent of spatial kernel_size.
         if k_t >= 5:
             self.dwconv_1d = TemporalReceptiveBlock(dim, k_t, deploy=deploy,
                                                     use_sync_bn=use_sync_bn)
@@ -472,11 +493,11 @@ class TemporalTransitionBranch(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# TemporalOverarchingBranch  (temporal mirror for DynamicSTORMBlock)
+# TemporalOverarchingBranch  (temporal mirror for STORMBlock)
 # ---------------------------------------------------------------------------
 
 class TemporalOverarchingBranch(nn.Module):
-    """1D temporal mirror of DynamicSTORMBlock's spatial attention path.
+    """1D temporal mirror of STORMBlock's spatial attention path.
 
     Option A: receives x_cat = dwconv_ctx(concat(x, h_x)) BEFORE norm_ctx,
     preserving direct access to the context signal h_x.
@@ -502,7 +523,7 @@ class TemporalOverarchingBranch(nn.Module):
         mirrors: dyconv_proj
 
     gate_1d is intentionally absent.  x_t is gated by the spatial gate in
-    DynamicSTORMBlock after spatio-temporal aggregation.  A second gate inside
+    STORMBlock after spatio-temporal aggregation.  A second gate inside
     this branch would double-gate x_t while x_attn + lepe are gated only once,
     dampening temporal gradients and creating an asymmetric contribution.
 
@@ -516,7 +537,6 @@ class TemporalOverarchingBranch(nn.Module):
                  deploy=False, use_sync_bn=False):
         super().__init__()
 
-        # Hard requirement (point d): no fallback, fail explicitly
         if not _NATTEN1D_AVAILABLE:
             raise RuntimeError(
                 '[VideoSTORM] na1d_qk / na1d_av not found in natten.functional. '
@@ -527,7 +547,7 @@ class TemporalOverarchingBranch(nn.Module):
         self.num_frames = num_frames
         self.dim = dim
         self.ctx_ch = ctx_ch
-        self.num_heads = num_heads        # already doubled by parent (num_heads * 2)
+        self.num_heads = num_heads
         self.head_dim_qk = dim // (2 * num_heads)
         self.head_dim_v  = dim // num_heads
         self.scale = self.head_dim_qk ** -0.5
@@ -536,7 +556,6 @@ class TemporalOverarchingBranch(nn.Module):
         k_t = _temporal_kernel_size(num_frames)
         self.k_t = k_t
 
-        # lepe_1d: TemporalReceptiveBlock(k_t) + BN1d  (operates on x_1d only)
         if k_t >= 5:
             lepe_conv = TemporalReceptiveBlock(dim, k_t, deploy=deploy,
                                                use_sync_bn=use_sync_bn)
@@ -545,33 +564,19 @@ class TemporalOverarchingBranch(nn.Module):
                                   padding=k_t // 2, groups=dim, bias=deploy)
         self.lepe_1d = nn.Sequential(lepe_conv, BN1d(dim))
 
-        # weight_q_1d: Conv1d(dim -> dim//2, 1)  on x_1d
         self.weight_q_1d = nn.Sequential(
             nn.Conv1d(dim, dim // 2, kernel_size=1, bias=False),
             BN1d(dim // 2))
 
-        # weight_k_1d: Conv1d(ctx_ch -> dim//2, 1)  on h_1d  — NO pooling.
-        # h_1d has shape (BHW, ctx_ch, T).  Keeping T positions intact ensures
-        # K varies along T, so na1d_qk produces distinct Q·K scores for each
-        # temporal neighbour and weight_q_1d receives a meaningful gradient.
-        # (Pooling to 1 would make K constant → uniform softmax → zero gradient.)
         self.weight_k_1d = nn.Sequential(
             nn.Conv1d(ctx_ch, dim // 2, kernel_size=1, bias=False),
             BN1d(dim // 2))
 
-        # dyconv_proj_1d: Conv1d(dim, dim, 1)
         self.dyconv_proj_1d = nn.Sequential(
             nn.Conv1d(dim, dim, kernel_size=1, bias=False),
             BN1d(dim))
 
-        # RPB: (heads, 2*k_t - 1) — one scalar per relative temporal distance
         self.rpb_1d = nn.Parameter(torch.zeros(num_heads, 2 * k_t - 1))
-
-        # gate_1d intentionally removed: x_t is gated by the spatial gate in
-        # DynamicSTORMBlock after spatio-temporal aggregation, so adding a
-        # second gate here would double-gate x_t and dampen temporal gradients.
-
-    # -- pivot helpers -------------------------------------------------------
 
     @staticmethod
     def _to_1d(x, B, T, H, W):
@@ -587,69 +592,36 @@ class TemporalOverarchingBranch(nn.Module):
                     .permute(0, 4, 3, 1, 2).contiguous()
                     .view(B * T, C, H, W))
 
-    # -- corrected RPB (point c) ---------------------------------------------
-
     def _apply_rpb_1d(self, attn, T):
-        """Apply relative positional bias with correct per-position indexing.
-
-        Mirrors _apply_rpb exactly in 1D:
-          - Interior frames (with full neighbourhood): centre index repeated.
-          - Edge frames: correctly offset indices, matching NATTEN's truncation.
-
-        attn  : (B*H*W, heads, T, k_t)
-        rpb_1d: (heads, 2*k_t - 1)
-        returns: attn + rpb  same shape
-        """
+        """Apply relative positional bias with correct per-position indexing."""
         k = self.k_t
         dev = attn.device
-        idx_t = torch.arange(0, k, device=dev)             # relative offsets 0..k-1
+        idx_t = torch.arange(0, k, device=dev)
         num_repeat = torch.ones(k, dtype=torch.long, device=dev)
-        num_repeat[k // 2] = T - (k - 1)                   # centre repeated T-(k-1) times
-        bias_idx = idx_t.repeat_interleave(num_repeat)      # (T,)
-        bias_idx = torch.flip(bias_idx, [0])                # same flip as spatial RPB
-        # rpb_1d[:, bias_idx]: (heads, T) -> (1, heads, T, 1) for broadcast
+        num_repeat[k // 2] = T - (k - 1)
+        bias_idx = idx_t.repeat_interleave(num_repeat)
+        bias_idx = torch.flip(bias_idx, [0])
         rpb = self.rpb_1d[:, bias_idx].unsqueeze(0).unsqueeze(-1)
         return attn + rpb
 
-    # -- cross-attention along T ---------------------------------------------
-
     def _temporal_attention(self, x_1d, h_1d):
-        """Local neighbourhood cross-attention along T.
-
-        Q from x_1d (content), K from h_1d (context, full T positions).
-        V from x_1d.
-
-        K varies along T because weight_k_1d applies Conv1d pointwise to all T
-        positions of h_1d without pooling.  This is essential: if K were constant
-        along T, all neighbourhood dot-products Q·K would be equal, softmax would
-        be uniform, and weight_q_1d would receive zero gradient.
-
-        x_1d : (B*H*W, dim,    T)
-        h_1d : (B*H*W, ctx_ch, T)
-        """
+        """Local neighbourhood cross-attention along T."""
         BHW, C, T = x_1d.shape
 
-        # Q: (BHW, dim//2, T) -> (BHW, heads, T, head_dim_qk)
         Q = self.weight_q_1d(x_1d) * self.scale
         Q = Q.view(BHW, self.num_heads, self.head_dim_qk, T).permute(0, 1, 3, 2).contiguous()
 
-        # K: (BHW, ctx_ch, T) -> (BHW, dim//2, T) -> (BHW, heads, T, head_dim_qk)
-        # Pointwise projection preserves T diversity: K[b,h,t,:] != K[b,h,t',:] in general.
-        K = self.weight_k_1d(h_1d)                              # (BHW, dim//2, T)
+        K = self.weight_k_1d(h_1d)
         K = K.view(BHW, self.num_heads, self.head_dim_qk, T).permute(0, 1, 3, 2).contiguous()
 
-        # V: full dim channels -> (BHW, heads, T, head_dim_v)
         V = x_1d.view(BHW, self.num_heads, self.head_dim_v, T).permute(0, 1, 3, 2).contiguous()
 
-        # Local neighbourhood cross-attention (NATTEN 1D — no fallback)
-        attn = _na1d_qk(Q, K, kernel_size=self.k_t)             # (BHW, heads, T, k_t)
+        attn = _na1d_qk(Q, K, kernel_size=self.k_t)
         attn = self._apply_rpb_1d(attn, T)
         attn = torch.softmax(attn, dim=-1)
-        out  = _na1d_av(attn, V, kernel_size=self.k_t)          # (BHW, heads, T, head_dim_v)
+        out  = _na1d_av(attn, V, kernel_size=self.k_t)
 
         return out.permute(0, 1, 3, 2).contiguous().view(BHW, C, T)
-
-    # -- forward -------------------------------------------------------------
 
     def forward(self, x_cat):
         """x_cat: (B*T, out_dim, H, W) = dwconv_ctx output before norm_ctx."""
@@ -657,20 +629,17 @@ class TemporalOverarchingBranch(nn.Module):
         T = self.num_frames
         B = BT // T
 
-        x_cat_1d = self._to_1d(x_cat, B, T, H, W)              # (BHW, out_dim, T)
+        x_cat_1d = self._to_1d(x_cat, B, T, H, W)
 
-        # Split into content (x_1d) and context (h_1d) — mirrors query_src / key_src
         x_1d, h_1d = torch.split(x_cat_1d, [self.dim, self.ctx_ch], dim=1)
 
-        lepe   = self.lepe_1d(x_1d)                             # (BHW, dim, T)
+        lepe   = self.lepe_1d(x_1d)
         x_attn = self._temporal_attention(x_1d, h_1d)
-        x_attn = self.dyconv_proj_1d(x_attn)                    # (BHW, dim, T)
+        x_attn = self.dyconv_proj_1d(x_attn)
 
-        # No gate_1d here: the spatial gate in DynamicSTORMBlock gates the full
-        # spatio-temporal aggregate (x_attn_spatial + lepe_spatial + x_t) uniformly.
-        x_t = x_attn + lepe                                     # (BHW, dim, T)
+        x_t = x_attn + lepe
 
-        return self._from_1d(x_t, B, T, H, W, self.dim)         # (B*T, dim, H, W)
+        return self._from_1d(x_t, B, T, H, W, self.dim)
 
     def reparameterize(self):
         if isinstance(self.lepe_1d[0], TemporalReceptiveBlock):
@@ -678,10 +647,11 @@ class TemporalOverarchingBranch(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# UniRepLKNetBlock  (unified k_t regime, no learnable fusion gate)
+# SpatioTemporalLargeKernelBlock  (unified k_t regime, no learnable fusion gate)
 # ---------------------------------------------------------------------------
 
-class UniRepLKNetBlock(nn.Module):
+#STLKBlock
+class SpatioTemporalLargeKernelBlock(nn.Module):
     def __init__(self, dim, kernel_size, drop_path=0.,
                  layer_scale_init_value=1e-6, deploy=False,
                  attempt_use_lk_impl=True, with_cp=False,
@@ -722,7 +692,6 @@ class UniRepLKNetBlock(nn.Module):
                       else None)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-        # Temporal branch: unified k_t regime, no learnable fusion gate.
         self.temporal_branch = None
         if num_frames > 0 and kernel_size != 0 and not deploy:
             self.temporal_branch = TemporalTransitionBranch(
@@ -811,14 +780,17 @@ class RetroActiveBridge(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# DynamicSTORMBlock  (Option A, no learnable fusion gate)
+# SpatioTemporalOverarchingRetroactiveModulationBlock
+# (Option A, res_scale=True aligned with OverLoCK)
 # ---------------------------------------------------------------------------
 
-class DynamicSTORMBlock(nn.Module):
+#STORMBlock
+class SpatioTemporalOverarchingRetroactiveModulationBlock(nn.Module):
     def __init__(self, dim, kernel_size, ctx_ch, smk_size=5, num_heads=4,
                  drop_path=0., layer_scale_init_value=1e-6, deploy=False,
                  attempt_use_lk_impl=True, with_cp=False, use_sync_bn=False,
-                 ffn_factor=2, is_first=False, is_last=False, num_frames=0):
+                 ffn_factor=2, is_first=False, is_last=False, num_frames=0,
+                 res_scale=True):
         super().__init__()
         assert _NATTEN_AVAILABLE and _EINOPS_AVAILABLE
         self.kernel_size = kernel_size
@@ -827,6 +799,7 @@ class DynamicSTORMBlock(nn.Module):
         self.scale = (dim // self.num_heads) ** -0.5
         self.is_first = is_first
         self.is_last = is_last
+        self.res_scale = res_scale
         self.with_cp = with_cp
         self.dim = dim
         self.ctx_ch = ctx_ch
@@ -868,11 +841,8 @@ class DynamicSTORMBlock(nn.Module):
             nn.Conv2d(dim, dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(dim),
             nn.SiLU())
-        self.se = SEBlock(dim, dim // 4)
+        self.se = SEModule(dim)
 
-        # Temporal branch (Option A): receives x_f = dwconv_ctx(x_cat)
-        # before norm_ctx, preserving direct access to h_x alongside x.
-        # TemporalOverarchingBranch raises RuntimeError if NATTEN 1D is absent.
         self.temporal_branch = None
         if num_frames > 0 and not deploy:
             self.temporal_branch = TemporalOverarchingBranch(
@@ -882,31 +852,31 @@ class DynamicSTORMBlock(nn.Module):
                 spatial_kernel_size=kernel_size,
                 deploy=False, use_sync_bn=use_sync_bn)
 
-        if not is_last:
-            self.proj = nn.Sequential(nn.BatchNorm2d(dim),
-                                      nn.Conv2d(dim, out_dim, kernel_size=1))
-        else:
-            self.proj = nn.Sequential(nn.BatchNorm2d(dim),
-                                      nn.Conv2d(dim, dim, kernel_size=1))
+        # FIX 2: proj always outputs out_dim — no is_last special case.
+        # Context channels flow through to the classification head,
+        # matching OverLoCK where the last DynamicConvBlock returns out_dim.
+        self.proj = nn.Sequential(nn.BatchNorm2d(dim),
+                                  nn.Conv2d(dim, out_dim, kernel_size=1))
 
-        res_dim = out_dim if not is_last else dim
-        self.ls1 = LayerScale(res_dim, init_value=layer_scale_init_value) \
+        # FIX 2 (cont): all downstream layers uniformly use out_dim.
+        # Previously is_last used dim, creating an inconsistency that
+        # discarded context channels at the last block.
+        self.ls1 = LayerScale(out_dim, init_value=layer_scale_init_value) \
                    if layer_scale_init_value and layer_scale_init_value > 0 \
                    else nn.Identity()
 
-        ffn_in = res_dim
-        self.dwconv2 = ResDWConv(ffn_in, kernel_size=3)
-        self.norm2 = LayerNorm2d(ffn_in)
+        self.dwconv2 = ResDWConv(out_dim, kernel_size=3)
+        self.norm2 = LayerNorm2d(out_dim)
 
-        ffn_dim = int(ffn_factor * ffn_in)
+        ffn_dim = int(ffn_factor * dim)
         self.mlp = nn.Sequential(
-            nn.Conv2d(ffn_in, ffn_dim, kernel_size=1),
+            nn.Conv2d(out_dim, ffn_dim, kernel_size=1),
             nn.GELU(),
             ResDWConv(ffn_dim, kernel_size=3),
             GRN(ffn_dim),
-            nn.Conv2d(ffn_dim, ffn_in, kernel_size=1))
+            nn.Conv2d(ffn_dim, out_dim, kernel_size=1))
 
-        self.ls2 = LayerScale(ffn_in, init_value=layer_scale_init_value) \
+        self.ls2 = LayerScale(out_dim, init_value=layer_scale_init_value) \
                    if layer_scale_init_value and layer_scale_init_value > 0 \
                    else nn.Identity()
 
@@ -941,14 +911,11 @@ class DynamicSTORMBlock(nn.Module):
         if not self.is_first:
             h_x = self.x_scale(h_x) + self.h_scale(h_r)
 
-        orig_x = x
-
         x_cat = torch.cat([x, h_x], dim=1)
-        x_f = self.dwconv_ctx(x_cat)         # (B, out_dim, H, W)
+        x_f = self.dwconv_ctx(x_cat)
         identity = x_f
 
         # Temporal branch (Option A): x_f before norm_ctx.
-        # Contains both x and h_x information, split internally by the branch.
         x_t = self.temporal_branch(x_f) if self.temporal_branch is not None else None
 
         x_f = self.norm_ctx(x_f)
@@ -1000,10 +967,7 @@ class DynamicSTORMBlock(nn.Module):
 
         x_attn = self.dyconv_proj(x_attn)
 
-        # Spatio-temporal aggregation then SE then gate (OverLoCK order):
-        #   (1) aggregate spatial (attn + lepe) and temporal contributions
-        #   (2) SE recalibrates channels on the complete spatio-temporal aggregate
-        #   (3) gate controls output magnitude after SE
+        # Spatio-temporal aggregation then SE then gate (OverLoCK order)
         x_agg = x_attn + lepe
         if x_t is not None:
             x_agg = x_agg + x_t
@@ -1011,14 +975,23 @@ class DynamicSTORMBlock(nn.Module):
         x_mixed = gate * self.se(x_agg)
         x_mixed = self.proj(x_mixed)
 
-        if self.is_last:
-            x = orig_x + self.drop_path(self.ls1(x_mixed))
+        # FIX 1+3: residual always on identity (fused x+h_x after dwconv_ctx).
+        # FIX 1: res_scale=True places LayerScale on the skip connection,
+        # matching OverLoCK's residual pattern where the identity can be
+        # attenuated to let new features dominate.
+        if self.res_scale:
+            x = self.ls1(identity) + self.drop_path(x_mixed)
         else:
             x = identity + self.drop_path(self.ls1(x_mixed))
 
         x = self.dwconv2(x)
-        x = x + self.drop_path(self.ls2(self.mlp(self.norm2(x))))
 
+        if self.res_scale:
+            x = self.ls2(x) + self.drop_path(self.mlp(self.norm2(x)))
+        else:
+            x = x + self.drop_path(self.ls2(self.mlp(self.norm2(x))))
+
+        # is_last returns full out_dim tensor (dim + ctx_ch channels preserved)
         if self.is_last:
             return x, None
         l_x, h_x_new = torch.split(x, [self.dim, self.ctx_ch], dim=1)
@@ -1105,7 +1078,7 @@ class VideoSTORM(nn.Module):
         cur = 0
         for i in range(4):
             stage = nn.Sequential(*[
-                UniRepLKNetBlock(
+                SpatioTemporalLargeKernelBlock(
                     dim=dims[i], kernel_size=kernel_sizes[i][j],
                     drop_path=dp_rates[cur + j],
                     layer_scale_init_value=layer_scale_init_value,
@@ -1124,16 +1097,10 @@ class VideoSTORM(nn.Module):
         sub_dpr = [x.item() for x in
                      torch.linspace(0, sub_drop_path_rate, sum(sub_depth))]
 
-        # DynamicSTORMBlock uses ls_init_value=1 (not the backbone's 1e-6).
-        # With 1e-6, sub-stage blocks are quasi-identity for thousands of
-        # iterations — appropriate for backbone blocks (preserve ImageNet weights)
-        # but counterproductive here where the blocks are newly initialised and
-        # need to contribute meaningful residuals from the first iteration.
-        # OverLoCK uses ls_init_value=1 for its equivalent sub-stage blocks.
         sub_ls_init = 1.0
 
         self.sub_blocks_s2 = nn.ModuleList([
-            DynamicSTORMBlock(
+            SpatioTemporalOverarchingRetroactiveModulationBlock(
                 dim=dims[2], kernel_size=sub_ks_s2,
                 ctx_ch=ctx_ch, smk_size=smk_size,
                 num_heads=sub_num_heads[0], drop_path=sub_dpr[i],
@@ -1141,13 +1108,14 @@ class VideoSTORM(nn.Module):
                 deploy=deploy, attempt_use_lk_impl=attempt_use_lk_impl,
                 with_cp=with_cp, use_sync_bn=use_sync_bn,
                 ffn_factor=sub_ffn_factor,
-                is_first=(i == 0), is_last=False, num_frames=num_frames)
+                is_first=(i == 0), is_last=False, num_frames=num_frames,
+                res_scale=True)
             for i in range(sub_depth[0])])
 
         sub_ks_s3 = kernel_sizes[3][0]
         n_s3 = sub_depth[1]
         self.sub_blocks_s3 = nn.ModuleList([
-            DynamicSTORMBlock(
+            SpatioTemporalOverarchingRetroactiveModulationBlock(
                 dim=dims[3], kernel_size=sub_ks_s3,
                 ctx_ch=ctx_ch, smk_size=smk_size,
                 num_heads=sub_num_heads[1], drop_path=sub_dpr[sub_depth[0] + i],
@@ -1155,25 +1123,23 @@ class VideoSTORM(nn.Module):
                 deploy=deploy, attempt_use_lk_impl=attempt_use_lk_impl,
                 with_cp=with_cp, use_sync_bn=use_sync_bn,
                 ffn_factor=sub_ffn_factor,
-                is_first=False, is_last=(i == n_s3 - 1), num_frames=num_frames)
+                is_first=False, is_last=(i == n_s3 - 1), num_frames=num_frames,
+                res_scale=True)
             for i in range(n_s3)])
 
+        # FIX 3: video_head accepts out_dim = dims[3] + ctx_ch.
+        # Matches OverLoCK's fusion_dim = embed_dim[-1] + embed_dim[-1]//4.
+        # Context channels now flow through the is_last block to the head.
+        head_in_dim = dims[3] + ctx_ch
         self.video_head = nn.Sequential(
-            nn.Conv2d(dims[3], projection, kernel_size=1, bias=False),
+            nn.Conv2d(head_in_dim, projection, kernel_size=1, bias=False),
             nn.BatchNorm2d(projection),
             nn.SiLU(),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(1),
             nn.Linear(projection, num_classes))
 
-        # Auxiliary head applied to ctx_s3 (raw stage-4 features before sub-stages).
-        # Mirrors OverLoCK's use_ds design: provides a direct gradient path to the
-        # backbone bypassing the sub-stage blocks, which is critical when:
-        #   (a) sub-stage LayerScale starts at 1 (blocks contribute immediately but
-        #       the backbone still benefits from an unobstructed gradient);
-        #   (b) the context features ctx must become discriminative early so that
-        #       weight_k in DynamicSTORMBlock receives a meaningful context signal.
-        # ctx_s3 has dims[3] channels (before context_encoder projection).
+        # Auxiliary head on raw stage-4 features (before sub-stages).
         self.aux_head = nn.Sequential(
             nn.BatchNorm2d(dims[3]),
             nn.AdaptiveAvgPool2d(1),
@@ -1185,11 +1151,6 @@ class VideoSTORM(nn.Module):
             self = nn.SyncBatchNorm.convert_sync_batchnorm(self)
 
     def _init_weights(self, m):
-        # Conv1d is explicitly included to match Conv2d/Linear init (trunc_normal std=0.02).
-        # Without it, depthwise Conv1d with kernel_size=7 defaults to kaiming with
-        # fan_in=7, giving std≈0.22 — about 11x larger than the 0.02 target, causing
-        # temporal branches to dominate spatial activations during early training.
-        # BN1d explicit init mirrors OverLoCK and guards against future regressions.
         if isinstance(m, (nn.Conv2d, nn.Conv1d, nn.Linear)):
             trunc_normal_(m.weight, std=.02)
             if hasattr(m, 'bias') and m.bias is not None:
@@ -1221,7 +1182,8 @@ class VideoSTORM(nn.Module):
         x, ctx = self.patch_embedx(x, ctx)
         for blk in self.sub_blocks_s3:
             x, ctx = blk(x, ctx, ctx_ori)
-        # x_s3 returned for auxiliary supervision (direct gradient to backbone)
+        # x has out_dim = dims[3] + ctx_ch channels (is_last returns full tensor)
+        # x_s3 returned for auxiliary supervision
         return x, x_s3
 
     @staticmethod
@@ -1242,14 +1204,9 @@ class VideoSTORM(nn.Module):
     def forward(self, x):
         feat_bt, ctx_bt, B, T = self.forward_features(x)
 
-        # Main prediction: per-frame logits averaged over T
         main_logits = self.video_head(feat_bt).view(B, T, -1).mean(1)
 
         if self.training:
-            # Auxiliary prediction from raw stage-4 features (ctx_bt).
-            # Provides a direct gradient to the backbone, bypassing sub-stages.
-            # The trainer must handle the dict output: loss = loss_main + λ * loss_aux
-            # (λ = 0.5 recommended following OverLoCK).
             aux_logits = self.aux_head(ctx_bt).view(B, T, -1).mean(1)
             return dict(main=main_logits, aux=aux_logits)
 
@@ -1379,4 +1336,4 @@ def videostorm_l(pretrained_2d=None, pretrained_2d_strict=False, **kwargs):
 
 
 if __name__ == '__main__':
-    print('VideoSTORM — no temporal learnable fusion gate')
+    print('VideoSTORM v2 — res_scale + is_last fix aligned with OverLoCK')

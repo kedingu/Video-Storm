@@ -450,20 +450,25 @@ def train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler, train_load
         else:
             if amp_enabled:
                 # ---- PyTorch native AMP branch ----------------------------
+                # [MODIFIED] autocast wraps ONLY the model forward pass.
+                # Loss is computed in fp32 outside autocast to avoid numerical
+                # instability in log-softmax (cross-entropy) under bf16/fp16.
                 with torch.amp.autocast(device_type='cuda', dtype=amp_dtype,
                                         enabled=True):
                     output = model(images)
-                    # [MODIFIED] Handle dict output (VideoSTORM aux head).
-                    if isinstance(output, dict):
-                        loss_main = criterion(output['main'], label_id)
-                        loss_aux  = criterion(output['aux'],  label_id)
-                        total_loss = ((loss_main + aux_ratio * loss_aux)
-                                      / max(1, config.TRAIN.ACCUMULATION_STEPS))
-                    else:
-                        loss_main = None
-                        loss_aux  = None
-                        total_loss = (criterion(output, label_id)
-                                      / max(1, config.TRAIN.ACCUMULATION_STEPS))
+
+                # Loss in fp32 — outside autocast.
+                if isinstance(output, dict):
+                    loss_main = criterion(output['main'].float(), label_id)
+                    loss_aux  = criterion(output['aux'].float(),  label_id)
+                    total_loss = ((loss_main + aux_ratio * loss_aux)
+                                  / max(1, config.TRAIN.ACCUMULATION_STEPS))
+                else:
+                    loss_main = None
+                    loss_aux  = None
+                    total_loss = (criterion(output.float(), label_id)
+                                  / max(1, config.TRAIN.ACCUMULATION_STEPS))
+
                 if scaler is not None and scaler.is_enabled():
                     scaler.scale(total_loss).backward()
                 else:
