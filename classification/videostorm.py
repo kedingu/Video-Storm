@@ -24,7 +24,7 @@ _IGEMM_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
-# TRB branch config — full mirror of DilatedReparamBlock up to k=15
+# TRB branch config — full mirror of DilatedReparamBlock, k=5..17
 # ---------------------------------------------------------------------------
 
 _TRB_BRANCH_CFG = {
@@ -34,11 +34,14 @@ _TRB_BRANCH_CFG = {
     11: ([5, 5, 3, 3, 3],   [1, 2, 3, 4, 5]),
     13: ([5, 7, 3, 3, 3],   [1, 2, 3, 4, 5]),
     15: ([5, 7, 3, 3, 3],   [1, 2, 3, 5, 7]),
+    17: ([5, 9, 3, 3, 3],   [1, 2, 4, 5, 7]),
 }
 
 
 def _temporal_kernel_size_sovereign(num_frames):
-    """Largest TRB-supported odd kernel <= num_frames."""
+    """Largest TRB-supported odd kernel <= num_frames.
+    8 frames -> 7, 16 frames -> 15, 32+ frames -> 17.
+    """
     if num_frames <= 0:
         return 3
     k_max = (num_frames - 1) // 2 * 2 + 1
@@ -270,7 +273,7 @@ class DilatedReparamBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# TemporalReceptiveBlock: 1D mirror of DilatedReparamBlock, up to k=15
+# TemporalReceptiveBlock: 1D mirror of DilatedReparamBlock, k=5..17
 # ---------------------------------------------------------------------------
 
 class TemporalReceptiveBlock(nn.Module):
@@ -334,11 +337,12 @@ class TemporalReceptiveBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 class TemporalTransitionBranch(nn.Module):
-    """1D temporal branch for STLKBlock.
+    """1D temporal branch.
 
     k_t determined solely by num_frames (sovereign regime):
-      num_frames=8  -> k_t=7
-      num_frames>=16 -> k_t=15
+      8 frames  -> k_t=7
+      16 frames -> k_t=15
+      32+ frames -> k_t=17
 
     k_t >= 5 -> TemporalReceptiveBlock(k_t) + BN1d
     k_t == 3 -> Conv1d(k_t=3) + BN1d
@@ -401,14 +405,24 @@ class TemporalTransitionBranch(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# SpatioTemporalLargeKernelBlock = UniRepLKNetBlock + parallel temporal add
+# SpatioTemporalLargeKernelBlock
+#   UniRepLKNetBlock + parallel temporal, early normalized fusion (Option C)
+#   Temporal on all blocks unconditionally
 # ---------------------------------------------------------------------------
 
 class SpatioTemporalLargeKernelBlock(nn.Module):
-    """UniRepLKNetBlock with a single parallel temporal branch.
+    """UniRepLKNetBlock with parallel temporal branch, fused before SE.
 
-    Spatial path is an exact copy of UniRepLKNetBlock — unchanged.
-    Temporal branch output is added directly (no learnable scale).
+    Option C — early normalized fusion:
+      spatial_normed  = BN(DWConv(x))
+      temporal_normed = BN1d(TempConv(x))
+      combined = spatial_normed + temporal_normed
+      residual = drop_path(gamma * FFN(SE(combined)))
+      out = x + residual
+
+    SE sees the combined spatio-temporal signal for channel recalibration.
+    FFN mixes spatio-temporal features via pointwise layers.
+    Spatial BN (self.norm) is unchanged — pretrained stats remain valid.
     """
 
     def __init__(self, dim, kernel_size, drop_path=0.,
@@ -456,16 +470,25 @@ class SpatioTemporalLargeKernelBlock(nn.Module):
                       else None)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-        # === Temporal branch — single parallel addition ===
+        # === Temporal branch — all blocks unconditionally ===
         self.temporal_branch = None
-        if num_frames > 0 and kernel_size != 0 and not deploy:
+        if num_frames > 0 and not deploy:
             self.temporal_branch = TemporalTransitionBranch(
                 dim=dim, num_frames=num_frames,
                 deploy=False, use_sync_bn=use_sync_bn)
 
     def compute_residual(self, x):
-        """Exact copy of UniRepLKNetBlock.compute_residual."""
-        y = self.se(self.norm(self.dwconv(x)))
+        # Spatial: DWConv -> BN (unchanged, pretrained stats valid)
+        y = self.norm(self.dwconv(x))
+
+        # Early normalized fusion: add temporal before SE
+        if self.temporal_branch is not None:
+            y = y + self.temporal_branch(x)
+
+        # SE on combined spatio-temporal signal
+        y = self.se(y)
+
+        # FFN on combined spatio-temporal signal
         y = self.pwconv2(self.act(self.pwconv1(y)))
         if self.gamma is not None:
             y = self.gamma.view(1, -1, 1, 1) * y
@@ -473,10 +496,7 @@ class SpatioTemporalLargeKernelBlock(nn.Module):
 
     def forward(self, inputs):
         def _f(x):
-            out = x + self.compute_residual(x)
-            if self.temporal_branch is not None:
-                out = out + self.temporal_branch(x)
-            return out
+            return x + self.compute_residual(x)
         return cp.checkpoint(_f, inputs) if self.with_cp and inputs.requires_grad \
                else _f(inputs)
 
@@ -555,10 +575,9 @@ _default_ks = {
 class VideoSTORM(nn.Module):
     """VideoSTORM: UniRepLKNet backbone + parallel temporal branches.
 
-    Exactly UniRepLKNet with a single TemporalTransitionBranch per block,
-    added in parallel to the spatial residual. No sub-stages, no learnable
-    temporal scale. Head mirrors UniRepLKNet: temporal mean + spatial GAP +
-    LayerNorm + Linear.
+    Each block fuses spatial and temporal via early normalized addition
+    (Option C) before SE and FFN. Head mirrors UniRepLKNet: temporal mean +
+    spatial GAP + LayerNorm + Linear.
     """
 
     def __init__(self, in_chans=3, num_classes=1000,
@@ -594,8 +613,7 @@ class VideoSTORM(nn.Module):
                 nn.Conv2d(dims[i], dims[i+1], kernel_size=3, stride=2, padding=1),
                 LayerNorm(dims[i+1], eps=1e-6, data_format='channels_first')))
 
-        # 4 stages — UniRepLKNetBlock replaced by STLKBlock (spatial identical,
-        # temporal branch added in parallel)
+        # 4 stages
         self.stages = nn.ModuleList()
         cur = 0
         for i in range(4):
@@ -611,7 +629,7 @@ class VideoSTORM(nn.Module):
             self.stages.append(stage)
             cur += depths[i]
 
-        # Head — mirrors UniRepLKNet: LayerNorm + Linear
+        # Head — mirrors UniRepLKNet
         self.norm = nn.LayerNorm(dims[-1], eps=1e-6)
         self.head = nn.Linear(dims[-1], num_classes)
 
@@ -658,9 +676,9 @@ class VideoSTORM(nn.Module):
         feat_bt, B, T = self.forward_features(x)
         _, C, H, W = feat_bt.shape
         # Temporal mean + spatial GAP + LayerNorm (mirrors UniRepLKNet)
-        feat = feat_bt.view(B, T, C, H, W).mean(dim=1)   # (B, C, H, W)
-        feat = self.norm(feat.mean([-2, -1]))               # (B, C)
-        return self.head(feat)                              # (B, num_classes)
+        feat = feat_bt.view(B, T, C, H, W).mean(dim=1)
+        feat = self.norm(feat.mean([-2, -1]))
+        return self.head(feat)
 
     def load_pretrained_2d(self, ckpt, strict=False, skip_head=True,
                             map_location='cpu'):
@@ -770,4 +788,4 @@ def videostorm_l(pretrained_2d=None, pretrained_2d_strict=False, **kwargs):
 
 
 if __name__ == '__main__':
-    print('VideoSTORM v4 — UniRepLKNet + parallel temporal')
+    print('VideoSTORM v5 — Option C early normalized fusion, k_t up to 17')
