@@ -63,7 +63,7 @@ def build_optimizer(config, model):
         weight_decay=config.TRAIN.WEIGHT_DECAY,
         lr=config.TRAIN.LR)
 
-    optimizer = optim.AdamW(parameters, betas=(0.9, 0.98), eps=1e-8)
+    optimizer = optim.AdamW(parameters, betas=(0.9, 0.999), eps=1e-8)
     return optimizer
 
 
