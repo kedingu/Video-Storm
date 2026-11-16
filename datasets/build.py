@@ -15,13 +15,13 @@ import os.path as osp
 import shutil
 import warnings
 from collections.abc import Mapping, Sequence
-# [MOD] Registry/build_from_cfg compatibility + file I/O (prefer MMEngine, fallback to MMCV 1.x)
+
 try:
-    from mmengine.registry import Registry, build_from_cfg  # ✅ MMEngine / MMCV 2
+    from mmengine.registry import Registry, build_from_cfg
     from mmengine.fileio import load as file_load, dump as file_dump
     HAVE_MMENGINE = True
 except ImportError:
-    from mmcv.utils import Registry, build_from_cfg          # ✅ MMCV 1.x
+    from mmcv.utils import Registry, build_from_cfg
     import mmcv
     file_load = mmcv.load
     file_dump = mmcv.dump
@@ -32,14 +32,12 @@ import copy
 from abc import ABCMeta, abstractmethod
 from collections import OrderedDict, defaultdict
 import tarfile
-from .pipeline import *  # assumes a Compose/registry based on PIPELINES below
+from .pipeline import *
 from torch.utils.data import DataLoader
-# [MOD] Use PyTorch collate (mmcv.parallel.collate removed in MMCV 2)
 from torch.utils.data.dataloader import default_collate as torch_default_collate
 import pandas as pd
-import csv  # [MOD] for robust .csv reading
+import csv
 
-# [MOD] Local registry for pipeline steps
 PIPELINES = Registry('pipeline')
 
 img_norm_cfg = dict(
@@ -61,13 +59,16 @@ class BaseDataset(Dataset, metaclass=ABCMeta):
                  power=0,
                  dynamic_length=False,):
         super().__init__()
-        # [MOD] Robustness when data_prefix == None
         self.use_tar_format = isinstance(data_prefix, str) and (".tar" in data_prefix)
-        data_prefix_clean = (data_prefix.replace(".tar", "") if isinstance(data_prefix, str) else data_prefix)
+        data_prefix_clean = (data_prefix.replace(".tar", "")
+                             if isinstance(data_prefix, str) else data_prefix)
 
         self.ann_file = ann_file
         self.repeat = repeat
-        self.data_prefix = osp.realpath(data_prefix_clean) if (data_prefix_clean is not None and osp.isdir(data_prefix_clean)) else data_prefix_clean
+        self.data_prefix = (osp.realpath(data_prefix_clean)
+                            if (data_prefix_clean is not None
+                                and osp.isdir(data_prefix_clean))
+                            else data_prefix_clean)
         self.test_mode = test_mode
         self.multi_class = multi_class
         self.num_classes = num_classes
@@ -96,13 +97,9 @@ class BaseDataset(Dataset, metaclass=ABCMeta):
 
     @abstractmethod
     def load_annotations(self):
-        """Load the annotation according to ann_file into video_infos."""
+        pass
 
-    # json annotations already looks like video_infos, so for each dataset,
-    # this func should be the same
     def load_json_annotations(self):
-        """Load json annotation file to get video information."""
-        # [MOD] file_load (MMEngine) or mmcv.load (fallback)
         video_infos = file_load(self.ann_file)
         num_videos = len(video_infos)
         path_key = 'frame_dir' if 'frame_dir' in video_infos[0] else 'filename'
@@ -133,18 +130,13 @@ class BaseDataset(Dataset, metaclass=ABCMeta):
 
     @staticmethod
     def dump_results(results, out):
-        """Dump data to json/yaml/pickle strings or files."""
-        # [MOD] file_dump (MMEngine) or mmcv.dump (fallback)
         return file_dump(results, out)
 
     def prepare_train_frames(self, idx):
-        """Prepare the frames for training given the index."""
         results = copy.deepcopy(self.video_infos[idx])
         results['modality'] = self.modality
         results['start_index'] = self.start_index
 
-        # prepare tensor in getitem
-        # If HVU, type(results['label']) is dict
         if self.multi_class and isinstance(results['label'], list):
             onehot = torch.zeros(self.num_classes)
             onehot[results['label']] = 1.
@@ -162,13 +154,10 @@ class BaseDataset(Dataset, metaclass=ABCMeta):
             return aug1
 
     def prepare_test_frames(self, idx):
-        """Prepare the frames for testing given the index."""
         results = copy.deepcopy(self.video_infos[idx])
         results['modality'] = self.modality
         results['start_index'] = self.start_index
 
-        # prepare tensor in getitem
-        # If HVU, type(results['label']) is dict
         if self.multi_class and isinstance(results['label'], list):
             onehot = torch.zeros(self.num_classes)
             onehot[results['label']] = 1.
@@ -177,14 +166,11 @@ class BaseDataset(Dataset, metaclass=ABCMeta):
         return self.pipeline(results)
 
     def __len__(self):
-        """Get the size of the dataset."""
         return len(self.video_infos)
 
     def __getitem__(self, idx):
-        """Get the sample for either training or testing given index."""
         if self.test_mode:
             return self.prepare_test_frames(idx)
-
         return self.prepare_train_frames(idx)
 
 
@@ -199,12 +185,10 @@ class VideoDataset(BaseDataset):
         return classes_all.values.tolist()
 
     def load_annotations(self):
-        """Load annotation file to get video information."""
         if self.ann_file.endswith('.json'):
             return self.load_json_annotations()
 
         video_infos = []
-        # [MOD] Robust CSV vs TXT reading
         if self.ann_file.endswith('.csv'):
             with open(self.ann_file, 'r', newline='') as fin:
                 reader = csv.reader(fin)
@@ -217,13 +201,13 @@ class VideoDataset(BaseDataset):
                         label = list(map(int, labels))
                     else:
                         if len(row) < 2:
-                            # [MOD] ignore/warn empty or malformed lines
                             warnings.warn(f"[load_annotations] ligne CSV invalide: {row}")
                             continue
                         filename, label = row[0], int(row[1])
                     if self.data_prefix is not None:
                         filename = osp.join(self.data_prefix, filename)
-                    video_infos.append(dict(filename=filename, label=label, tar=self.use_tar_format))
+                    video_infos.append(dict(filename=filename, label=label,
+                                            tar=self.use_tar_format))
         else:
             with open(self.ann_file, 'r') as fin:
                 for line in fin:
@@ -241,12 +225,20 @@ class VideoDataset(BaseDataset):
                         filename, label = parts[0], int(parts[1])
                     if self.data_prefix is not None:
                         filename = osp.join(self.data_prefix, filename)
-                    video_infos.append(dict(filename=filename, label=label, tar=self.use_tar_format))
+                    video_infos.append(dict(filename=filename, label=label,
+                                            tar=self.use_tar_format))
         return video_infos
 
 
+# [MODIFIED B5] SubsetRandomSampler: __iter__ now seeds its generator with
+# self.epoch so validation order is deterministic and reproducible across runs
+# for a given epoch (previously torch.randperm used the global RNG, giving a
+# different order each call). set_epoch() already stores the epoch value;
+# it now actually drives the permutation.
 class SubsetRandomSampler(torch.utils.data.Sampler):
-    r"""Samples elements randomly from a given list of indices, without replacement.
+    r"""Samples elements randomly from a given list of indices, without
+    replacement. The permutation is seeded by the epoch so order is
+    deterministic and reproducible for a given (run, epoch) pair.
 
     Arguments:
         indices (sequence): a sequence of indices
@@ -257,7 +249,11 @@ class SubsetRandomSampler(torch.utils.data.Sampler):
         self.indices = indices
 
     def __iter__(self):
-        return (self.indices[i] for i in torch.randperm(len(self.indices)))
+        # [MODIFIED B5] Seed the generator so val order is reproducible.
+        g = torch.Generator()
+        g.manual_seed(self.epoch)
+        return (self.indices[i]
+                for i in torch.randperm(len(self.indices), generator=g))
 
     def __len__(self):
         return len(self.indices)
@@ -266,7 +262,6 @@ class SubsetRandomSampler(torch.utils.data.Sampler):
         self.epoch = epoch
 
 
-# [MOD] Simplified collate via PyTorch (no dependency on mmcv.parallel.collate)
 def mmcv_collate(batch, samples_per_gpu=1):
     return torch_default_collate(batch)
 
@@ -276,16 +271,30 @@ def build_dataloader(logger, config):
 
     train_pipeline = [
         dict(type='DecordInit'),
-        dict(type='SampleFrames', clip_len=1, frame_interval=1, num_clips=config.DATA.NUM_FRAMES),
+        dict(type='SampleFrames',
+             clip_len=1,
+             # [MODIFIED B2] Use config value instead of hardcoded 1.
+             # With clip_len=1 (TSN-style), frame_interval is semantically
+             # inert (no within-clip stride), but forwarding the config value
+             # ensures consistency and avoids silent errors if clip_len changes.
+             frame_interval=config.AUG.FRAME_INTERVAL,
+             num_clips=config.DATA.NUM_FRAMES),
         dict(type='DecordDecode'),
         dict(type='Resize', scale=(-1, scale_resize)),
         dict(
             type='MultiScaleCrop',
             input_size=config.DATA.INPUT_SIZE,
             scales=(1, 0.875, 0.75, 0.66),
-            random_crop=False,
+            # [MODIFIED B1] random_crop=True (was False).
+            # With random_crop=False the crop position was constrained to a
+            # fixed set of anchor points (corners + centre), limiting spatial
+            # diversity. random_crop=True allows the crop to land anywhere in
+            # the image at the selected scale, giving a much larger effective
+            # augmentation space.
+            random_crop=True,
             max_wh_scale_gap=1),
-        dict(type='Resize', scale=(config.DATA.INPUT_SIZE, config.DATA.INPUT_SIZE), keep_ratio=False),
+        dict(type='Resize', scale=(config.DATA.INPUT_SIZE, config.DATA.INPUT_SIZE),
+             keep_ratio=False),
         dict(type='Flip', flip_ratio=config.AUG.FLIP_RATIO),
         dict(type='ColorJitter', p=config.AUG.COLOR_JITTER),
         dict(type='GrayScale', p=config.AUG.GRAY_SCALE),
@@ -318,23 +327,36 @@ def build_dataloader(logger, config):
 
     val_pipeline = [
         dict(type='DecordInit'),
-        dict(type='SampleFrames', clip_len=1, frame_interval=1, num_clips=config.DATA.NUM_FRAMES, test_mode=True),
+        dict(type='SampleFrames',
+             clip_len=1,
+             # [MODIFIED B2] Consistent with train pipeline.
+             frame_interval=config.AUG.FRAME_INTERVAL,
+             num_clips=config.DATA.NUM_FRAMES,
+             test_mode=True),
         dict(type='DecordDecode'),
         dict(type='Resize', scale=(-1, scale_resize)),
         dict(type='CenterCrop', crop_size=config.DATA.INPUT_SIZE),
         dict(type='Normalize', **img_norm_cfg),
         dict(type='FormatShape', input_format='NCHW'),
         dict(type='Collect', keys=['imgs', 'label'], meta_keys=[]),
-        dict(type='ToTensor', keys=['imgs'])
+        # [MODIFIED B4] Added 'label' to ToTensor keys for consistency with
+        # train_pipeline. default_collate already handled int→tensor conversion
+        # implicitly, but explicit conversion is clearer and avoids any
+        # edge-case differences in collation behaviour.
+        dict(type='ToTensor', keys=['imgs', 'label']),
     ]
+
     if config.TEST.NUM_CROP == 3:
-        val_pipeline[3] = dict(type='Resize', scale=(-1, config.DATA.INPUT_SIZE))
-        val_pipeline[4] = dict(type='ThreeCrop', crop_size=config.DATA.INPUT_SIZE)
+        val_pipeline[3] = dict(type='Resize',
+                                scale=(-1, config.DATA.INPUT_SIZE))
+        val_pipeline[4] = dict(type='ThreeCrop',
+                                crop_size=config.DATA.INPUT_SIZE)
     if config.TEST.NUM_CLIP > 1:
         val_pipeline[1] = dict(
             type='SampleFrames',
             clip_len=1,
-            frame_interval=1,
+            # [MODIFIED B2] Consistent with base val_pipeline.
+            frame_interval=config.AUG.FRAME_INTERVAL,
             num_clips=config.DATA.NUM_FRAMES,
             multiview=config.TEST.NUM_CLIP
         )
@@ -353,7 +375,12 @@ def build_dataloader(logger, config):
         batch_size=2,
         num_workers=12,
         pin_memory=True,
-        drop_last=True,
+        # [MODIFIED B3] drop_last=False (was True).
+        # With drop_last=True a few validation samples were systematically
+        # discarded each epoch. AverageMeter.sync() uses weighted sum/count
+        # reduction which handles variable batch sizes and uneven per-GPU
+        # sample counts correctly, so drop_last=False is safe here.
+        drop_last=False,
         collate_fn=partial(mmcv_collate, samples_per_gpu=2),
     )
 

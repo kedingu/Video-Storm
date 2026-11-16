@@ -16,6 +16,7 @@ import time
 import numpy as np
 import random
 
+# Apex (optional)
 try:
     from apex import amp
     HAS_APEX = True
@@ -105,6 +106,7 @@ def _safe_manual_load_pretrained(model: torch.nn.Module, pretrained_path: str,
 
     model_state = model.state_dict()
 
+    # Re-init head if shape mismatches
     head_names = [
         ("head.weight",       "head.bias"),
         ("fc.weight",         "fc.bias"),
@@ -123,6 +125,7 @@ def _safe_manual_load_pretrained(model: torch.nn.Module, pretrained_path: str,
                         f"[PRETRAINED] Reinit head due to shape mismatch: "
                         f"replaced {w_name}/{b_name}")
 
+    # Drop any remaining mismatched keys
     drop_keys = []
     for k, v in list(state_dict.items()):
         if k in model_state and model_state[k].shape != v.shape:
@@ -178,6 +181,7 @@ def main(config):
 
     logger.info(f"Trainable params count (pre-optim): {_count_trainables(model):,}")
 
+    # Disable FIX_TEXT for non-CLIP models
     if getattr(config.MODEL, "FIX_TEXT", False):
         has_clip_like_names = any(
             ("visual." in n or "text" in n or "token" in n)
@@ -189,6 +193,31 @@ def main(config):
             config.MODEL.FIX_TEXT = False
             config.freeze()
 
+    # [ADDED #1] Convert all BatchNorm layers to SyncBatchNorm BEFORE cuda()
+    # and DDP wrapping.
+    #
+    # Root cause fixed: VideoSTORM.__init__ previously contained:
+    #   self = nn.SyncBatchNorm.convert_sync_batchnorm(self)
+    # which is a Python no-op -- reassigning 'self' inside __init__ has no
+    # effect on the object visible to the caller. As a result, all BN layers
+    # in the model (especially the many fresh BN2d layers in STORMBlocks)
+    # remained as independent per-GPU BatchNorm throughout training, producing
+    # unreliable statistics with small per-GPU batch sizes and preventing the
+    # STORMBlock from converging properly.
+    #
+    # nn.SyncBatchNorm.convert_sync_batchnorm converts ALL _BatchNorm
+    # subclasses (BatchNorm1d, BatchNorm2d, BatchNorm3d) while preserving
+    # existing running_mean / running_var / weight / bias values -- so
+    # pretrained BN statistics loaded above are fully preserved.
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        logger.info(
+            f"[SyncBN] Converted all BatchNorm layers to SyncBatchNorm "
+            f"(world_size={dist.get_world_size()}).")
+    else:
+        logger.info("[SyncBN] Single-GPU mode: skipping SyncBN conversion.")
+
+    # Loss & mixup
     mixup_fn = None
     if config.AUG.MIXUP > 0:
         criterion = SoftTargetCrossEntropy()
@@ -237,10 +266,9 @@ def main(config):
                 "Still no trainable parameter after unfreezing attempt. "
                 "Check your config.")
 
-    # AMP — bypass Apex when BF16 (Apex does not support BF16)
+    # AMP (fp16 / bf16)
     amp_enabled, amp_dtype = _amp_flags_and_dtype(config)
-    if HAS_APEX and (getattr(config.TRAIN, "OPT_LEVEL", "O1") != "O0") \
-            and amp_dtype != torch.bfloat16 and not eval_only:
+    if HAS_APEX and (getattr(config.TRAIN, "OPT_LEVEL", "O1") != "O0") and amp_dtype != torch.bfloat16 and not eval_only:
         model, optimizer = amp.initialize(
             models=model, optimizers=optimizer,
             opt_level=config.TRAIN.OPT_LEVEL)
@@ -263,6 +291,7 @@ def main(config):
 
     start_epoch, max_accuracy = 0, 0.0
 
+    # Auto-resume
     if config.TRAIN.AUTO_RESUME:
         resume_file = auto_resume_helper(config.OUTPUT)
         if resume_file:
@@ -274,12 +303,45 @@ def main(config):
             logger.info(
                 f'no checkpoint found in {config.OUTPUT}, ignoring auto resume')
 
+    # Resume
     if config.MODEL.RESUME:
         target_model = (model.module
                         if isinstance(model, torch.nn.parallel.DistributedDataParallel)
                         else model)
         start_epoch, max_accuracy = load_checkpoint(
             config, target_model, optimizer, lr_scheduler, logger)
+
+    # [ADDED] Evaluate the resumed checkpoint before continuing training.
+    # Rationale: if the job was killed between the periodic save (epoch N) and
+    # the validation that would have followed it, the checkpoint holds weights
+    # from epoch N but max_accuracy only reflects the last *evaluated* epoch.
+    # Validating here closes that gap: if epoch N is actually the best, its
+    # accuracy is measured now and best.pth is saved immediately, before
+    # epoch N+1 training begins.
+    if config.MODEL.RESUME and not config.TEST.ONLY_TEST:
+        logger.info(
+            f"[RESUME] Validating checkpoint (epoch={start_epoch - 1}) "
+            f"before resuming training (stored max_accuracy={max_accuracy:.2f}%)...")
+        resumed_acc = validate(val_loader, model, config, amp_enabled, amp_dtype, scaler)
+        logger.info(
+            f"[RESUME] Checkpoint validation: Acc@1={resumed_acc:.2f}% "
+            f"(stored max_accuracy={max_accuracy:.2f}%)")
+        is_best = resumed_acc > max_accuracy
+        if is_best:
+            max_accuracy = resumed_acc
+            if dist.get_rank() == 0:
+                epoch_saving(
+                    config, start_epoch - 1,
+                    model.module if isinstance(
+                        model, torch.nn.parallel.DistributedDataParallel) else model,
+                    max_accuracy, optimizer, lr_scheduler, logger,
+                    config.OUTPUT, is_best=True)
+                logger.info(
+                    f"[RESUME] New best checkpoint saved at epoch {start_epoch - 1}: "
+                    f"{max_accuracy:.2f}%")
+        else:
+            max_accuracy = max(max_accuracy, resumed_acc)
+        logger.info(f"[RESUME] max_accuracy updated to {max_accuracy:.2f}%")
 
     if config.TEST.ONLY_TEST:
         acc1 = validate(val_loader, model, config, amp_enabled, amp_dtype, scaler)
@@ -288,14 +350,19 @@ def main(config):
         return
 
     logger.info(f"ACCUMULATION_STEPS = {config.TRAIN.ACCUMULATION_STEPS}")
+    logger.info(f"AUX_LOSS_WEIGHT = {config.TRAIN.AUX_LOSS_WEIGHT}")
+
+    # [ADDED #8] Log differential LR config so it is visible in experiment logs.
+    lr_backbone_ratio = getattr(config.TRAIN, 'LR_BACKBONE_RATIO', 1.0)
+    if lr_backbone_ratio < 1.0:
+        logger.info(
+            f"Differential LR: backbone lr={config.TRAIN.LR * lr_backbone_ratio:.2e} "
+            f"({lr_backbone_ratio}x), heads lr={config.TRAIN.LR:.2e}")
+    else:
+        logger.info(f"Uniform LR: {config.TRAIN.LR:.2e} for all parameters.")
 
     # ---------------------------------------------------------------------------
     # Training loop
-    #
-    # Checkpoint strategy:
-    #   1. Save IMMEDIATELY after training (before validation).
-    #   2. Validate at multiples of 5 (incl. epoch 0) and last 3 epochs.
-    #   3. Save "best" checkpoint only when accuracy improves.
     # ---------------------------------------------------------------------------
     for epoch in range(start_epoch, config.TRAIN.EPOCHS):
 
@@ -303,7 +370,7 @@ def main(config):
         train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler,
                         train_loader, config, mixup_fn, amp_enabled, amp_dtype, scaler)
 
-        # Save immediately after training
+        # Step 1: checkpoint immediately after training
         if dist.get_rank() == 0 and (
                 epoch % config.SAVE_FREQ == 0
                 or epoch == config.TRAIN.EPOCHS - 1):
@@ -314,19 +381,21 @@ def main(config):
                 max_accuracy, optimizer, lr_scheduler, logger,
                 config.OUTPUT, is_best=False)
 
-        # Selective validation
-        every_5 = (epoch % 5 == 0)
-        last_3 = (epoch >= config.TRAIN.EPOCHS - 3)
+        # Step 2: selective validation schedule
+        every_5   = (epoch % 5 == 0)
+        last_3    = (epoch >= config.TRAIN.EPOCHS - 20)
         do_validate = every_5 or last_3
 
         if not do_validate:
             logger.info(f"Epoch {epoch}: skipping validation.")
             continue
 
+        # Step 3: validation
         acc1 = validate(val_loader, model, config, amp_enabled, amp_dtype, scaler)
         logger.info(
             f"Accuracy of the network on the {len(val_data)} test videos: {acc1:.1f}%")
 
+        # Step 4: save best checkpoint if accuracy improved
         is_best = acc1 > max_accuracy
         if is_best:
             max_accuracy = acc1
@@ -365,6 +434,9 @@ def train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler, train_load
     num_steps = len(train_loader)
     batch_time = AverageMeter()
     tot_loss_meter = AverageMeter()
+    aux_loss_meter = AverageMeter()
+
+    aux_ratio = config.TRAIN.AUX_LOSS_WEIGHT
 
     start = time.time()
     end = time.time()
@@ -380,32 +452,57 @@ def train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler, train_load
         if mixup_fn is not None:
             images, label_id = mixup_fn(images, label_id)
 
-        # Forward + backward
-        if HAS_APEX and (getattr(config.TRAIN, "OPT_LEVEL", "O1") != "O0") \
-                and amp_dtype != torch.bfloat16:
-            # Apex AMP
+        if HAS_APEX and (getattr(config.TRAIN, "OPT_LEVEL", "O1") != "O0") and amp_dtype != torch.bfloat16:
+            # ---- Apex AMP branch ------------------------------------------
             output = model(images)
-            total_loss = criterion(output, label_id) \
-                         / max(1, config.TRAIN.ACCUMULATION_STEPS)
+            if isinstance(output, dict):
+                loss_main = criterion(output['main'], label_id)
+                loss_aux  = criterion(output['aux'],  label_id)
+                total_loss = ((loss_main + aux_ratio * loss_aux)
+                              / max(1, config.TRAIN.ACCUMULATION_STEPS))
+            else:
+                loss_main = None
+                loss_aux  = None
+                total_loss = (criterion(output, label_id)
+                              / max(1, config.TRAIN.ACCUMULATION_STEPS))
             with amp.scale_loss(total_loss, optimizer) as scaled_loss:
                 scaled_loss.backward()
-        elif amp_enabled:
-            # PyTorch native AMP — loss computed in fp32 outside autocast
-            with torch.amp.autocast(device_type='cuda', dtype=amp_dtype,
-                                    enabled=True):
-                output = model(images)
-            total_loss = criterion(output.float(), label_id) \
-                         / max(1, config.TRAIN.ACCUMULATION_STEPS)
-            if scaler is not None and scaler.is_enabled():
-                scaler.scale(total_loss).backward()
-            else:
-                total_loss.backward()
         else:
-            # fp32
-            output = model(images)
-            total_loss = criterion(output, label_id) \
-                         / max(1, config.TRAIN.ACCUMULATION_STEPS)
-            total_loss.backward()
+            if amp_enabled:
+                # ---- PyTorch native AMP branch ----------------------------
+                with torch.amp.autocast(device_type='cuda', dtype=amp_dtype,
+                                        enabled=True):
+                    output = model(images)
+
+                if isinstance(output, dict):
+                    loss_main = criterion(output['main'].float(), label_id)
+                    loss_aux  = criterion(output['aux'].float(),  label_id)
+                    total_loss = ((loss_main + aux_ratio * loss_aux)
+                                  / max(1, config.TRAIN.ACCUMULATION_STEPS))
+                else:
+                    loss_main = None
+                    loss_aux  = None
+                    total_loss = (criterion(output.float(), label_id)
+                                  / max(1, config.TRAIN.ACCUMULATION_STEPS))
+
+                if scaler is not None and scaler.is_enabled():
+                    scaler.scale(total_loss).backward()
+                else:
+                    total_loss.backward()
+            else:
+                # ---- fp32 branch ------------------------------------------
+                output = model(images)
+                if isinstance(output, dict):
+                    loss_main = criterion(output['main'], label_id)
+                    loss_aux  = criterion(output['aux'],  label_id)
+                    total_loss = ((loss_main + aux_ratio * loss_aux)
+                                  / max(1, config.TRAIN.ACCUMULATION_STEPS))
+                else:
+                    loss_main = None
+                    loss_aux  = None
+                    total_loss = (criterion(output, label_id)
+                                  / max(1, config.TRAIN.ACCUMULATION_STEPS))
+                total_loss.backward()
 
         def _do_step():
             if (amp_enabled and scaler is not None
@@ -435,19 +532,39 @@ def train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler, train_load
         torch.cuda.synchronize()
 
         tot_loss_meter.update(total_loss.item(), len(label_id))
+        if loss_aux is not None:
+            aux_loss_meter.update(loss_aux.item(), len(label_id))
+
         batch_time.update(time.time() - end)
         end = time.time()
 
         if idx % config.PRINT_FREQ == 0:
             lr = optimizer.param_groups[0]['lr']
+            # [ADDED #8] Also log backbone LR when differential LR is active.
+            lr_backbone_ratio = getattr(config.TRAIN, 'LR_BACKBONE_RATIO', 1.0)
+            lr_info = f'lr {lr:.9f}'
+            if lr_backbone_ratio < 1.0 and len(optimizer.param_groups) > 2:
+                # Backbone groups are appended last by set_weight_decay_with_lr_scale
+                lr_bb = optimizer.param_groups[-1]['lr']
+                lr_info = f'lr_head {lr:.9f} lr_bb {lr_bb:.9f}'
+
             memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
             etas = batch_time.avg * (num_steps - idx)
-            logger.info(
-                f'Train: [{epoch}/{config.TRAIN.EPOCHS}][{idx}/{num_steps}]\t'
-                f'eta {datetime.timedelta(seconds=int(etas))} lr {lr:.9f}\t'
-                f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
-                f'tot_loss {tot_loss_meter.val:.4f} ({tot_loss_meter.avg:.4f})\t'
-                f'mem {memory_used:.0f}MB')
+            if aux_loss_meter.count > 0:
+                logger.info(
+                    f'Train: [{epoch}/{config.TRAIN.EPOCHS}][{idx}/{num_steps}]\t'
+                    f'eta {datetime.timedelta(seconds=int(etas))} {lr_info}\t'
+                    f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
+                    f'tot_loss {tot_loss_meter.val:.4f} ({tot_loss_meter.avg:.4f})\t'
+                    f'aux_loss {aux_loss_meter.val:.4f} ({aux_loss_meter.avg:.4f})\t'
+                    f'mem {memory_used:.0f}MB')
+            else:
+                logger.info(
+                    f'Train: [{epoch}/{config.TRAIN.EPOCHS}][{idx}/{num_steps}]\t'
+                    f'eta {datetime.timedelta(seconds=int(etas))} {lr_info}\t'
+                    f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
+                    f'tot_loss {tot_loss_meter.val:.4f} ({tot_loss_meter.avg:.4f})\t'
+                    f'mem {memory_used:.0f}MB')
 
     epoch_time = time.time() - start
     logger.info(
@@ -479,7 +596,7 @@ def validate(val_loader, model, config, amp_enabled, amp_dtype, scaler):
         tot_similarity = torch.zeros((b, config.DATA.NUM_CLASSES)).cuda()
 
         for i in range(n):
-            image = _image[:, i, :, :, :, :]
+            image = _image[:, i, :, :, :, :]  # (b, t, c, h, w)
             image_input = image.cuda(non_blocking=True)
 
             if amp_enabled:
@@ -488,6 +605,11 @@ def validate(val_loader, model, config, amp_enabled, amp_dtype, scaler):
                     output = model(image_input)
             else:
                 output = model(image_input)
+
+            if isinstance(output, dict):
+                output = output['main']
+            elif isinstance(output, (list, tuple)):
+                output = output[0]
 
             similarity = output.view(b, -1).softmax(dim=-1)
             tot_similarity += similarity
